@@ -1,7 +1,7 @@
 """
 WDS component-level crossmatch to Gaia DR3.
 
-Final production implementation used for the catalog analysis. The method is:
+The calculation uses the following algorithm:
 
 1. Propagate WDS component coordinates from epoch 2000.0 to Gaia epoch 2016.0
    on the celestial sphere using the WDS proper-motion vector.
@@ -32,8 +32,8 @@ Methodological details
 - The displaced H0 quasi-color marginal is a 2--10 component Gaussian mixture.
   As in Medan's released source, fitting uses (data-model)/sqrt(data) on nonzero
   bins and BIC = N ln(RSS/N) + 3*n_components*ln(N). Gaussian means are
-  constrained to the occupied displaced-q interval of each stratum to prevent
-  unsupported background tails.
+  constrained to the occupied displaced-q interval of each stratum. These bounds
+  constrain the Gaussian centers; tails can extend outside that interval.
 - The independent angular x quasi-color H0 surface receives a scalar C fitted
   to occupied 2-D displaced cells. Medan's scale S, percentile smoothing,
   H1 subtraction, empirical priors, and Bayes grid are then constructed.
@@ -73,6 +73,33 @@ Outputs
   source (if any) and the highest-posterior individual eligible candidate.
 - A scored-candidate table containing every final candidate edge within 5 arcsec.
 - Scalar model diagnostics and compressed model arrays for reproducibility.
+- Per-start Gaussian fit-audit CSV at <model-summary>.fit_audit.csv.
+
+Deterministic Gaussian initialization
+-------------------------------------
+For every Gaussian-component count n=2..10, seven fixed initial conditions are
+tried: the original Medan-style coincident start, midpoint weighted-quantile and
+uniform starts, and deterministic half-/double-width variants. No random-number
+generator or seed is used. Within each n, the converged fit with minimum weighted
+least-squares cost is retained; Medan's unweighted RSS-based BIC then selects n.
+The optimizer budget is max_nfev=10000. Per-start fit diagnostics are saved at
+<model-summary>.fit_audit.csv.
+
+Assignment margins are computed for every retained connected component.
+assigned_edge_margin is the objective loss on forbidding that selected real edge.
+assignment_group_margin is the best different real mapping gap within the retained
+nonnegative-utility graph, including orphan alternatives. Dummy permutations do
+not count. Neither margin is a probability. Group sizes and objectives are
+repeated per target. A missing group margin indicates a target outside the retained
+graph; a missing edge margin indicates that no real edge was assigned.
+
+Input selection and validation
+-----------------------------
+The module-level test switch selects the example-data path when True and the
+production WDS path when False. --components can override either default.
+The parser accepts fixed-format HHMMSS.ss and signed DDMMSS.s coordinates, fails
+on malformed/out-of-range records, and permits the valid direction (0, 0).
+Both retrieval services use the same downstream calibration and assignment.
 """
 
 import argparse
@@ -81,6 +108,7 @@ import numpy as np
 import pandas as pd
 import time
 import warnings
+import re
 
 from astroquery.gaia import Gaia
 from astroquery.utils.tap.core import TapPlus
@@ -97,13 +125,25 @@ from scipy.optimize import curve_fit, linear_sum_assignment, least_squares, Opti
 # Production configuration
 # -----------------------------------------------------------------------------
 DEFAULT_GAIA_BACKEND = "ari" # "ari" or "esa"
+FIT_MAX_NFEV = 10000
+# Seven fixed Gaussian starts; no random-number generator is used.
+DETERMINISTIC_START_SPECS = [
+    ("original", "original", None),
+    ("quantile_mid_w1", "quantile_mid", 1.0),
+    ("uniform_mid_w1", "uniform_mid", 1.0),
+    ("quantile_mid_w0p5", "quantile_mid", 0.5),
+    ("quantile_mid_w2", "quantile_mid", 2.0),
+    ("uniform_mid_w0p5", "uniform_mid", 0.5),
+    ("uniform_mid_w2", "uniform_mid", 2.0),
+]
+FIT_AUDIT = []
 ARI_TAP_URL = "https://gaia.ari.uni-heidelberg.de/tap"
 ARI_BATCH_SIZE = 10000
 ESA_BATCH_SIZE = 10000
 
 test = False
 
-DEFAULT_COMPONENTS_FILE = "./data/wds_components.summ.txt" # test file: \example_daata\wds_components.summ.extended.txt
+DEFAULT_COMPONENTS_FILE = "./data/wds_components.summ.txt"
 
 if test:
     DEFAULT_COMPONENTS_FILE = "./example_data/wds_components.summ.extended.txt"
@@ -187,7 +227,46 @@ def parse_wds_components(components_file):
     print("Parsing WDS file (Vectorized)...")
 
     with open(components_file, "r", encoding="latin-1") as f:
-        lines = [line.rstrip("\n\r").ljust(135) for line in f]
+        lines = [line.rstrip("\n\r") for line in f]
+    if not lines:
+        raise ValueError("WDS input is empty.")
+    for number, line in enumerate(lines, 1):
+        # The WDS coordinate fields are fixed-width, but their printed decimal
+        # precision can vary and trailing component-type columns may be blank.
+        # Require the coordinate fields themselves, then validate their numeric
+        # structure and ranges without imposing a particular number of decimals.
+        if len(line) < 130:
+            raise ValueError(
+                f"Malformed WDS record at input line {number}: expected at least 130 characters, got {len(line)}."
+            )
+
+        ra = line[112:121].strip()
+        dec = line[121:130].strip()
+        if (re.fullmatch(r"\d{6}(?:\.\d*)?", ra) is None
+                or re.fullmatch(r"[+-]\d{6}(?:\.\d*)?", dec) is None):
+            raise ValueError(
+                f"Malformed WDS coordinate at input line {number}: RA={ra!r}, Dec={dec!r}"
+            )
+
+        hh, mm, ss = int(ra[:2]), int(ra[2:4]), float(ra[4:])
+        dd, dm, ds = int(dec[1:3]), int(dec[3:5]), float(dec[5:])
+
+        # WDS fixed-width coordinates can contain a rounded seconds field of
+        # exactly 60.0 (e.g. -03 56 60.0). Treat that as the normal sexagesimal
+        # carry into the next minute rather than rejecting an otherwise valid
+        # coordinate. The arithmetic conversion below already performs that carry.
+        if not (0 <= hh < 24 and 0 <= mm < 60 and 0 <= ss <= 60
+                and 0 <= dd <= 90 and 0 <= dm < 60 and 0 <= ds <= 60):
+            raise ValueError(
+                f"Out-of-range WDS coordinate at input line {number}: RA={ra!r}, Dec={dec!r}"
+            )
+
+        ra_deg_check = (hh + mm / 60.0 + ss / 3600.0) * 15.0
+        dec_abs_check = dd + dm / 60.0 + ds / 3600.0
+        if not (ra_deg_check <= 360.0 and dec_abs_check <= 90.0):
+            raise ValueError(
+                f"Out-of-range WDS coordinate at input line {number}: RA={ra!r}, Dec={dec!r}"
+            )
 
     df = pd.DataFrame({"raw": lines})
     df = df[df["raw"].str.len() >= 130].copy()
@@ -236,19 +315,14 @@ def parse_wds_components(components_file):
     df["component_type"] = df["raw"].str.slice(131, 134).str.strip()
 
     # Coordinate calculation before spherical propagation.
-    df["ra_deg_calc"] = (
+    df["ra_deg_calc"] = ((
         df["ra_hh"] + df["ra_mm"] / 60.0 + df["ra_ss"] / 3600.0
-    ) * 15.0
+    ) * 15.0) % 360.0
     df["dec_deg_calc"] = df["dec_sign"] * (
         df["dec_deg"] + df["dec_mm"] / 60.0 + df["dec_ss"] / 3600.0
     )
 
-    # Filter missing coordinates.
-    valid_coords = (
-        (df["ra"].str.len() > 0) &
-        ((df["ra_deg_calc"] != 0.0) | (df["dec_deg_calc"] != 0.0))
-    )
-    df = df[valid_coords].copy()
+    # Coordinates were validated before conversion. (0, 0) is a valid direction.
 
     # Unique ID for tracking.
     df["upload_id"] = np.arange(len(df))
@@ -298,7 +372,7 @@ def propagate_coordinates(wds_df):
         wds_df["pmdec_primary"]
     ).astype(float)
 
-    # 2. WDS 'P' note: centiarcsec/yr -> mas/yr.
+    # 2. WDS 'P' note: arcsec per 100 years -> mas/yr.
     mask_p = wds_df["notes"].str.contains("P", na=False).to_numpy()
     pm_ra_cosdec[mask_p] *= 10.0
     pm_dec[mask_p] *= 10.0
@@ -774,21 +848,65 @@ def _medan_quasicolor_weighted_residual(params, x, data):
     return (data - _medan_quasicolor_model_from_vector(x, params)) / np.sqrt(data)
 
 
+def _medan_quasicolor_weighted_residual_jacobian(params, x, data):
+    """Exact Jacobian of the weighted Medan residual."""
+    x = np.asarray(x, dtype=float)
+    data = np.asarray(data, dtype=float)
+    p = np.asarray(params, dtype=float)
+    inv_sqrt = 1.0 / np.sqrt(data)
+    J = np.empty((len(x), len(p)), dtype=float)
+    for j, i in enumerate(range(0, len(p), 3)):
+        amplitude, mean, sigma = p[i:i + 3]
+        dx = x - mean
+        e = np.exp(-0.5 * (dx / sigma) ** 2)
+        g = amplitude * e
+        J[:, 3 * j] = -e * inv_sqrt
+        J[:, 3 * j + 1] = -(g * dx / sigma**2) * inv_sqrt
+        J[:, 3 * j + 2] = -(g * dx**2 / sigma**3) * inv_sqrt
+    return J
+
+
+def _weighted_quantile_means(x, y, probabilities):
+    probabilities = np.asarray(probabilities, dtype=float)
+    cdf = (np.cumsum(y) - 0.5 * y) / np.sum(y)
+    return np.interp(probabilities, cdf, x)
+
+
+def _deterministic_gaussian_start(spec, n_components, x_fit, y_fit,
+                                  q_fit_min, q_fit_max):
+    """Construct one fixed, data-derived initialization vector."""
+    name, placement, width_factor = spec
+    mode_center = float(x_fit[int(np.argmax(y_fit))])
+
+    if placement == "original":
+        return np.tile([1000.0, mode_center, 1.0], n_components)
+
+    probs = (np.arange(n_components, dtype=float) + 0.5) / n_components
+    if placement == "quantile_mid":
+        means = _weighted_quantile_means(x_fit, y_fit, probs)
+    elif placement == "uniform_mid":
+        means = q_fit_min + probs * (q_fit_max - q_fit_min)
+    else:
+        raise ValueError(f"Unknown deterministic placement rule: {placement}")
+
+    nominal_width = max(
+        (q_fit_max - q_fit_min) / (2.0 * n_components),
+        DMAG_BIN_WIDTH,
+    )
+    width = max(float(width_factor) * nominal_width, DMAG_BIN_WIDTH)
+    sigmas = np.full(n_components, width, dtype=float)
+    amplitudes = np.maximum(np.interp(means, x_fit, y_fit), 1.0)
+    return np.column_stack([amplitudes, means, sigmas]).ravel()
+
+
 def fit_medan_quasicolor_model_from_counts(measured, centers):
-    """
-    Reproduce the released Medan n_gauss1d()/n_gauss1d_BIC() construction.
+    """Fit Medan's quasi-color background model deterministically.
 
-    Only nonzero Hmag bins are fit. For each n=2,...,10 every Gaussian starts
-    at A=1000, mu=the Hmag mode, sigma=1, with A>=0 and sigma>=0. The released
-    code uses lmfit.minimize; here scipy.optimize.least_squares is used to avoid
-    an extra dependency. One deliberate guard is added for this WDS application:
-    each Gaussian mean is constrained to the occupied displaced-q interval, so an
-    otherwise unconstrained component cannot wander into an unobserved part of
-    the global q grid and create artificial background mass. The weighted residual
-    objective, starting values, component search, and BIC otherwise follow Medan.
-    x_scale='jac' is a numerical conditioning option only.
-
-        BIC = N*ln(sum((data-model)^2)/N) + 3*n*ln(N)
+    For each component count n=2..10, seven fixed initial configurations are
+    tried. The successful solution with minimum weighted least-squares cost is
+    retained for that n. The final n is then selected with Medan's unweighted
+    RSS-based BIC. This keeps the original fitting/model-selection distinction
+    with seven fixed initializations and no random-number generator.
     """
     measured = np.asarray(measured, dtype=float)
     centers = np.asarray(centers, dtype=float)
@@ -799,40 +917,80 @@ def fit_medan_quasicolor_model_from_counts(measured, centers):
     if len(y_fit) == 0:
         return None
 
-    mode_center = float(centers[int(np.argmax(measured))])
     q_fit_min = float(np.min(x_fit))
     q_fit_max = float(np.max(x_fit))
     if not np.isfinite(q_fit_min) or not np.isfinite(q_fit_max) or q_fit_min >= q_fit_max:
         return None
 
     best = None
-
     for n_components in range(2, 11):
+        # Require more occupied bins than free Gaussian parameters.
         if len(y_fit) <= 3 * n_components:
             continue
 
-        p0 = []
-        lower = []
-        upper = []
-        for _ in range(n_components):
-            p0.extend([1000.0, mode_center, 1.0])
-            lower.extend([0.0, q_fit_min, 1e-8])
-            upper.extend([np.inf, q_fit_max, np.inf])
+        lower = np.tile([0.0, q_fit_min, 1e-8], n_components)
+        upper = np.tile([np.inf, q_fit_max, np.inf], n_components)
 
-        try:
-            result = least_squares(
-                _medan_quasicolor_weighted_residual,
-                np.asarray(p0, dtype=float),
-                args=(x_fit, y_fit),
-                bounds=(np.asarray(lower, dtype=float), np.asarray(upper, dtype=float)),
-                x_scale="jac",
-                max_nfev=10000
+        result = None
+        winning_name = None
+        audit_indices = []
+        for spec in DETERMINISTIC_START_SPECS:
+            start_name = spec[0]
+            start = _deterministic_gaussian_start(
+                spec, n_components, x_fit, y_fit, q_fit_min, q_fit_max
             )
-        except Exception:
+            audit = {
+                "initialization": "deterministic_7start",
+                "n_components": n_components,
+                "start_name": start_name,
+                "success": False,
+            }
+            try:
+                trial = least_squares(
+                    _medan_quasicolor_weighted_residual,
+                    start,
+                    jac=_medan_quasicolor_weighted_residual_jacobian,
+                    args=(x_fit, y_fit),
+                    bounds=(lower, upper),
+                    x_scale="jac",
+                    max_nfev=FIT_MAX_NFEV,
+                )
+                usable = (
+                    trial.success
+                    and np.all(np.isfinite(trial.x))
+                    and np.isfinite(trial.cost)
+                )
+                audit.update(
+                    success=bool(usable),
+                    weighted_cost=float(trial.cost) if np.isfinite(trial.cost) else np.nan,
+                    nfev=int(trial.nfev),
+                    message=str(trial.message),
+                )
+                if usable:
+                    residual_ss = float(np.sum(
+                        (y_fit - _medan_quasicolor_model_from_vector(x_fit, trial.x)) ** 2
+                    ))
+                    audit["bic"] = float(
+                        len(y_fit) * np.log(max(
+                            residual_ss / len(y_fit), np.finfo(float).tiny
+                        ))
+                        + 3 * n_components * np.log(len(y_fit))
+                    )
+                    if result is None or trial.cost < result.cost:
+                        result = trial
+                        winning_name = start_name
+            except Exception as exc:
+                audit["message"] = f"{type(exc).__name__}: {exc}"
+            FIT_AUDIT.append(audit)
+            audit_indices.append(len(FIT_AUDIT) - 1)
+
+        if result is None:
             continue
 
-        if not result.success or not np.all(np.isfinite(result.x)):
-            continue
+        for idx in audit_indices:
+            FIT_AUDIT[idx]["selected_for_n"] = (
+                FIT_AUDIT[idx].get("start_name") == winning_name
+            )
 
         model_fit = _medan_quasicolor_model_from_vector(x_fit, result.x)
         model_all = _medan_quasicolor_model_from_vector(centers, result.x)
@@ -850,11 +1008,10 @@ def fit_medan_quasicolor_model_from_counts(measured, centers):
             model_counts = np.maximum(model_all, 0.0)
             model_total = float(np.sum(model_counts))
             outside_occupied = (centers < q_fit_min) | (centers > q_fit_max)
-            if model_total > 0.0:
-                mass_outside = float(np.sum(model_counts[outside_occupied]) / model_total)
-            else:
-                mass_outside = np.nan
-
+            mass_outside = (
+                float(np.sum(model_counts[outside_occupied]) / model_total)
+                if model_total > 0.0 else np.nan
+            )
             best = {
                 "counts": model_counts,
                 "bic": float(bic),
@@ -864,11 +1021,11 @@ def fit_medan_quasicolor_model_from_counts(measured, centers):
                 "n_positive_bins": int(n_points),
                 "optimizer_cost_weighted": float(result.cost),
                 "optimizer_nfev": int(result.nfev),
+                "selected_start": winning_name,
                 "model_mass_outside_occupied_range": mass_outside,
             }
 
     return best
-
 
 def fit_linear_scale_through_origin(model_values, data_values):
     """Fit Medan's scalar C with curve_fit(scale, model, observed)."""
@@ -917,8 +1074,8 @@ def fit_displaced_h0_model(disp_dist, disp_dmag):
         tied to their query/grid setup, whereas this code excludes the outer
         ANGULAR_H0_EDGE_TRIM_ARCSEC;
       * Gaussian means are constrained to the occupied displaced-q interval of
-        the stratum, preventing unconstrained components from wandering into
-        empty quasi-color tails while leaving the 2--10 component model intact.
+        the stratum. These bounds constrain the centers, not the tails; Gaussian
+        tails can extend outside the occupied interval.
     """
     disp_dist = np.asarray(disp_dist, dtype=float)
     disp_dmag = np.asarray(disp_dmag, dtype=float)
@@ -1134,8 +1291,9 @@ def build_bayesian_model_theta_only(raw_valid, disp_valid):
 
     This model is calibrated independently of Gaia G. The RAW and DISPLACED
     training samples are selected only by WDS reference-magnitude and |b|
-    strata; Gaia photometric availability is not part of the selection. It is
-    therefore the appropriate fallback when m_WDS is known but Gaia G is absent.
+    strata; Gaia photometric availability is not part of the selection. This fallback
+    assumes transfer to the missing-G population at fixed theta, m_WDS and |b|;
+    its probability calibration depends on that transfer assumption.
 
     The displaced H0(theta) frequency model is the same edge-trimmed linear
     angular model used inside the 2-D construction. Because it is already fit
@@ -1423,7 +1581,10 @@ def build_empirical_bayesian_models(raw_table, disp_table):
 
             model_2d = None
             if len(raw_2d) > 0 and len(disp_2d) > 0:
+                audit_start = len(FIT_AUDIT)
                 model_2d = build_bayesian_model_2d(raw_2d, disp_2d)
+                for audit in FIT_AUDIT[audit_start:]:
+                    audit.update(b_min=b_min, b_max=b_max, mag_min=mag_min, mag_max=mag_max)
 
             if model_2d is None:
                 print(
@@ -1508,7 +1669,7 @@ def score_candidates(raw_table, model_bundle):
     Finite-G quasi-colors must lie inside the frozen production support.
     Cells with zero support under both H1 and H0 remain unmodeled (NaN).
     """
-    raw_df = raw_table.to_pandas().copy()
+    raw_df = raw_table.to_pandas().copy() if isinstance(raw_table, Table) else raw_table.copy()
 
     models_2d = model_bundle["models_2d"]
     models_theta = model_bundle["models_theta"]
@@ -1702,13 +1863,48 @@ def build_graph_components(scored_df):
     return components, edges_by_w
 
 
+def assignment_margins(cost, M, N, pair_to_row, row_ind, col_ind):
+    """Return edge exclusion margins and the runner-up gap on retained real edges.
+
+    Dummy permutations never define a different association. Alternatives may
+    orphan a target. Margins use clipped pairwise log-odds, not probabilities.
+    The graph excludes negative edges, so these are margins within that retained
+    graph, not runner-up gaps over discarded negative-utility associations.
+    """
+    optimum = -float(cost[row_ind, col_ind].sum())
+    selected = {(int(r), int(c)) for r, c in zip(row_ind, col_ind)
+                if r < M and c < N and (r, c) in pair_to_row}
+    edge_margins = {}
+    for r, c in sorted(selected):
+        saved = cost[r, c]
+        cost[r, c] = np.inf
+        try:
+            ar, ac = linear_sum_assignment(cost)
+            alternative = -float(cost[ar, ac].sum())
+        finally:
+            cost[r, c] = saved
+        gap = optimum - alternative
+        if gap < -1e-8 * max(1.0, abs(optimum)):
+            raise RuntimeError("Alternative assignment exceeds reported optimum.")
+        edge_margins[pair_to_row[(r, c)]] = max(0.0, gap)
+    group_gap = min(edge_margins.values(), default=np.inf)
+    # A strict superset of the selected real edges can differ only by adding
+    # zero-utility edges between currently orphaned nodes. Exclusion alone would
+    # miss that kind of tie (including an all-orphan optimum).
+    used_w = {r for r, _ in selected}
+    used_g = {c for _, c in selected}
+    if any(r not in used_w and c not in used_g and cost[r, c] == 0.0
+           for r, c in pair_to_row):
+        group_gap = 0.0
+    return optimum, group_gap, edge_margins
+
+
 def optimize_global_assignments(scored_df, wds_df):
     """
     Solve the global one-to-one WDS-component/Gaia assignment problem.
 
-    This is mathematically the same objective as v9, but avoids repeated full-table
-    Pandas scans. Candidate edges are indexed once, each connected component sees
-    only its own edges, and final output assembly is performed with vectorized joins.
+    Candidate edges are indexed once. Each connected component is solved
+    independently with assignment margins, and final output uses vectorized joins.
     """
     print("\nResolving global one-to-one assignments (Budavari & Basu)...")
     t0 = time.time()
@@ -1716,7 +1912,7 @@ def optimize_global_assignments(scored_df, wds_df):
     scored_df = scored_df.copy()
     wds_df = wds_df.copy()
 
-    # Ensure exact integer identifiers, especially after resuming from CSV.
+    # Require integer identifiers for graph construction and output joins.
     for col in ("upload_id", "source_id", "row_id"):
         scored_df[col] = pd.to_numeric(scored_df[col], errors="raise").astype(np.int64)
 
@@ -1730,19 +1926,31 @@ def optimize_global_assignments(scored_df, wds_df):
 
     components, edges_by_w = build_graph_components(scored_df)
     if components:
-        largest_w = max(len(cw) for cw, _ in components)
-        largest_g = max(len(cg) for _, cg in components)
-        largest_matrix = max(len(cw) + len(cg) for cw, cg in components)
+        # Select one actual component by padded matrix size, breaking size ties
+        # by edge count. All reported counts belong to that same component.
+        largest_id, (largest_w_nodes, largest_g_nodes) = max(
+            enumerate(components),
+            key=lambda item: (
+                len(item[1][0]) + len(item[1][1]),
+                sum(len(edges_by_w[w]) for w in item[1][0]),
+            ),
+        )
+        largest_w = len(largest_w_nodes)
+        largest_g = len(largest_g_nodes)
+        largest_edges = sum(len(edges_by_w[w]) for w in largest_w_nodes)
         print(
             f"Assignment graph: {len(components)} connected components; "
-            f"largest has {largest_w} WDS / {largest_g} Gaia nodes "
-            f"(max padded matrix size {largest_matrix})."
+            f"largest by padded matrix size is group {largest_id}: "
+            f"{largest_w} WDS / {largest_g} Gaia / {largest_edges} edges "
+            f"(padded matrix size {largest_w + largest_g})."
         )
     else:
         print("Assignment graph contains no non-negative-utility candidate edges.")
 
     assigned_source = {}
     assigned_row = {}
+    group_diagnostics = {}
+    edge_margin_by_w = {}
 
     # Highest-posterior individual eligible candidate is retained regardless of
     # whether posterior < 0.5, so it remains useful as a diagnostic suggestion.
@@ -1773,7 +1981,7 @@ def optimize_global_assignments(scored_df, wds_df):
         best_summary["best_source_id"] = best_summary["best_source_id"].astype("Int64")
 
     # Solve each independent connected component using only pre-indexed edges.
-    for component_w, component_g in components:
+    for group_id, (component_w, component_g) in enumerate(components):
         w_nodes = sorted(component_w)
         g_nodes = sorted(component_g)
         M = len(w_nodes)
@@ -1797,6 +2005,16 @@ def optimize_global_assignments(scored_df, wds_df):
                 pair_to_row[(i, j)] = row_id
 
         row_ind, col_ind = linear_sum_assignment(cost)
+        optimum, group_gap, edge_gaps = assignment_margins(
+            cost, M, N, pair_to_row, row_ind, col_ind)
+        for w in w_nodes:
+            group_diagnostics[w] = {
+                "assignment_group_id": group_id,
+                "assignment_group_n_wds": M, "assignment_group_n_gaia": N,
+                "assignment_group_n_edges": len(pair_to_row),
+                "assignment_group_objective": optimum,
+                "assignment_group_margin": group_gap,
+            }
 
         for r, c in zip(row_ind, col_ind):
             if r >= M or c >= N:
@@ -1810,6 +2028,7 @@ def optimize_global_assignments(scored_df, wds_df):
             g = int(row["source_id"])
             assigned_source[w] = g
             assigned_row[w] = row_id
+            edge_margin_by_w[w] = edge_gaps.get(row_id, np.nan)
 
     print(
         f"Hungarian/component stage finished in {time.time() - t0:.1f} s; "
@@ -1885,7 +2104,15 @@ def optimize_global_assignments(scored_df, wds_df):
         ["assigned_global", "not_assigned_global"],
         default="no_modeled_candidate"
     )
-
+    for col in ("assignment_group_id", "assignment_group_n_wds",
+                "assignment_group_n_gaia", "assignment_group_n_edges",
+                "assignment_group_objective", "assignment_group_margin"):
+        values = {w: d[col] for w, d in group_diagnostics.items()}
+        final_df[col] = final_df["upload_id"].map(values)
+        if col in ("assignment_group_id", "assignment_group_n_wds",
+                   "assignment_group_n_gaia", "assignment_group_n_edges"):
+            final_df[col] = final_df[col].astype("Int64")
+    final_df["assigned_edge_margin"] = final_df["upload_id"].map(edge_margin_by_w)
     print(f"Final catalog assembly finished in {time.time() - t0:.1f} s total.")
     return final_df
 
@@ -2067,72 +2294,6 @@ def _check_candidate_pair_uniqueness(scored_candidates):
 
 
 
-def _validate_resume_identity(scored_candidates, wds_df):
-    """
-    Verify that upload_id still refers to the same WDS component on resume.
-
-    upload_id is intentionally a run-local row identifier. A scored-candidate
-    file must therefore never be combined with a reordered or modified component
-    input file merely because the integer IDs happen to overlap. Compare the
-    stored (upload_id, wds_id, component) mapping for every represented candidate
-    against the freshly parsed WDS table and abort on any mismatch.
-    """
-    required_candidate = {"upload_id", "wds_id", "component"}
-    required_wds = {"upload_id", "wds_id", "component"}
-    missing_candidate = required_candidate.difference(scored_candidates.columns)
-    missing_wds = required_wds.difference(wds_df.columns)
-    if missing_candidate or missing_wds:
-        raise RuntimeError(
-            "Cannot validate resume identity mapping. "
-            f"Missing candidate columns={sorted(missing_candidate)}, "
-            f"missing WDS columns={sorted(missing_wds)}."
-        )
-
-    cand = scored_candidates[["upload_id", "wds_id", "component"]].copy()
-    cand["upload_id"] = pd.to_numeric(cand["upload_id"], errors="raise").astype(np.int64)
-    cand["wds_id"] = cand["wds_id"].astype(str).str.strip()
-    cand["component"] = cand["component"].astype(str).str.strip()
-
-    # One upload_id must not encode multiple WDS identities inside the candidate file.
-    identity_counts = cand.groupby("upload_id", sort=False)[["wds_id", "component"]].nunique(dropna=False)
-    internally_ambiguous = identity_counts[(identity_counts["wds_id"] > 1) | (identity_counts["component"] > 1)]
-    if not internally_ambiguous.empty:
-        examples = internally_ambiguous.head(5).index.tolist()
-        raise RuntimeError(
-            "Scored-candidate file contains upload_id values mapped to multiple WDS identities. "
-            f"Examples: {examples}"
-        )
-
-    cand = cand.drop_duplicates("upload_id", keep="first")
-    current = wds_df[["upload_id", "wds_id", "component"]].copy()
-    current["upload_id"] = pd.to_numeric(current["upload_id"], errors="raise").astype(np.int64)
-    current["wds_id"] = current["wds_id"].astype(str).str.strip()
-    current["component"] = current["component"].astype(str).str.strip()
-    current.rename(columns={"wds_id": "wds_id_current", "component": "component_current"}, inplace=True)
-
-    check = cand.merge(current, on="upload_id", how="left", validate="one_to_one", indicator=True)
-    mismatch = (
-        (check["_merge"] != "both") |
-        (check["wds_id"] != check["wds_id_current"]) |
-        (check["component"] != check["component_current"])
-    )
-    if mismatch.any():
-        bad = check.loc[
-            mismatch,
-            ["upload_id", "wds_id", "component", "wds_id_current", "component_current", "_merge"],
-        ].head(10)
-        raise RuntimeError(
-            "Resume identity check failed: the scored-candidate file was not generated "
-            "from this exact WDS component ordering/content. Refusing to attach old "
-            "upload_id values to potentially different components. First mismatches:\n"
-            + bad.to_string(index=False)
-        )
-
-    print(
-        f"Resume identity check passed for {len(cand)} WDS components represented "
-        "in the scored-candidate file."
-    )
-
 def build_argument_parser():
     parser = argparse.ArgumentParser(
         description="Empirical-Bayesian WDS component crossmatch to Gaia DR3."
@@ -2168,19 +2329,12 @@ def build_argument_parser():
         default=DEFAULT_MODEL_ARRAYS_FILE,
         help="Compressed model-array NPZ.",
     )
-    parser.add_argument(
-        "--resume-assignment",
-        action="store_true",
-        help=(
-            "Skip all Gaia queries and model construction and rebuild only the "
-            "global assignment/final catalog from --candidates."
-        ),
-    )
     return parser
 
 
 def main(argv=None):
     args = build_argument_parser().parse_args(argv)
+    FIT_AUDIT.clear()
 
     # 1. Parse and prepare WDS components.
     wds_df = parse_wds_components(args.components)
@@ -2190,33 +2344,6 @@ def main(argv=None):
     _ensure_parent(args.candidates)
     _ensure_parent(args.model_summary)
     _ensure_parent(args.model_arrays)
-
-    if args.resume_assignment:
-        if not os.path.exists(args.candidates):
-            raise FileNotFoundError(
-                f"Cannot resume: scored-candidate file does not exist: {args.candidates}"
-            )
-
-        print(f"Resuming from scored candidates: {args.candidates}")
-        scored_candidates = pd.read_csv(
-            args.candidates,
-            low_memory=False,
-            dtype={"upload_id": "int64", "source_id": "int64", "row_id": "int64"},
-        )
-        _check_candidate_pair_uniqueness(scored_candidates)
-        _validate_resume_identity(scored_candidates, wds_df)
-
-        final_matches = optimize_global_assignments(scored_candidates, wds_df)
-        final_matches.to_csv(args.output, index=False)
-
-        n_assigned = int(
-            np.sum(np.asarray(final_matches["assignment_status"]) == "assigned_global")
-        )
-        print("\nCrossmatch assignment resume complete!")
-        print(f"WDS components: {len(wds_df)}")
-        print(f"Globally assigned components: {n_assigned}")
-        print(f"Saved final catalog to: {args.output}")
-        return
 
     print(f"Using Gaia query backend: {args.backend}")
 
@@ -2257,6 +2384,8 @@ def main(argv=None):
     # 6. Build the empirical Medan-style Bayesian distributions from 15 arcsec.
     model_bundle = build_empirical_bayesian_models(raw_model_results, disp_results)
 
+    pd.DataFrame(FIT_AUDIT).to_csv(args.model_summary + '.fit_audit.csv', index=False)
+
     # 7. Save the calibrated model for reproducibility/auditing.
     save_model_diagnostics(
         model_bundle,
@@ -2271,9 +2400,7 @@ def main(argv=None):
     # path. Abort rather than silently selecting one representation of the pair.
     _check_candidate_pair_uniqueness(scored_candidates)
 
-    # 9. Save all scored final-candidate edges before the assignment stage. This
-    # makes --resume-assignment deterministic and avoids re-querying Gaia after an
-    # assignment/output-only interruption.
+    # 9. Save every scored final-candidate edge before assignment.
     scored_candidates.to_csv(args.candidates, index=False)
 
     # 10. Global one-to-one assignment.
