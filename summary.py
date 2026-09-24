@@ -33,6 +33,7 @@ import astropy.units as u
 # Suppress openpyxl styling warnings if any
 warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
 
+# Enable testing mode
 test = False
 
 summary_file = './data/wdsweb_summ2.txt'

@@ -141,17 +141,21 @@ ARI_TAP_URL = "https://gaia.ari.uni-heidelberg.de/tap"
 ARI_BATCH_SIZE = 10000
 ESA_BATCH_SIZE = 10000
 
+# Enable testing mode
 test = False
 
 DEFAULT_COMPONENTS_FILE = "./data/wds_components.summ.txt"
-
-if test:
-    DEFAULT_COMPONENTS_FILE = "./example_data/wds_components.summ.extended.txt"
-
 DEFAULT_OUTPUT_FILE = "./outputs/components_crossmatch_bayesian.csv"
 DEFAULT_CANDIDATE_OUTPUT_FILE = "./outputs/components_crossmatch_candidates_scored.csv"
 DEFAULT_MODEL_SUMMARY_FILE = "./outputs/components_crossmatch_model_summary.csv"
 DEFAULT_MODEL_ARRAYS_FILE = "./outputs/components_crossmatch_model_arrays.npz"
+
+if test:
+    DEFAULT_COMPONENTS_FILE = "./example_data/wds_components.summ.extended.txt"
+    DEFAULT_OUTPUT_FILE = "./example_outputs/components_crossmatch_bayesian.csv"
+    DEFAULT_CANDIDATE_OUTPUT_FILE = "./example_outputs/components_crossmatch_candidates_scored.csv"
+    DEFAULT_MODEL_SUMMARY_FILE = "./example_outputs/components_crossmatch_model_summary.csv"
+    DEFAULT_MODEL_ARRAYS_FILE = "./example_outputs/components_crossmatch_model_arrays.npz"
 
 gaia_epoch = 2016.0
 wds_epoch = 2000.0
