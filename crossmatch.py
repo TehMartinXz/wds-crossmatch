@@ -109,6 +109,8 @@ import pandas as pd
 import time
 import warnings
 import re
+import hashlib
+import glob
 
 from astroquery.gaia import Gaia
 from astroquery.utils.tap.core import TapPlus
@@ -717,6 +719,62 @@ def query_gaia_selected_backend(wds_df, backend, is_displaced=False, model_sampl
     raise ValueError(
         f"Unknown Gaia backend {backend!r}. Choose 'ari' or 'esa'."
     )
+
+
+# -----------------------------------------------------------------------------
+# On-disk cache for Gaia queries
+# -----------------------------------------------------------------------------
+CACHE_DIR = "./cache"
+
+
+def _file_fingerprint(path, n_chars=12):
+    """Return the first n_chars of the SHA-256 digest of an input file."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        # Read in 1 MiB chunks so large WDS files never load fully into memory.
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()[:n_chars]
+
+
+def query_gaia_cached(wds_df, backend, components_file,
+                      is_displaced=False, model_sample=False):
+    """On-disk cache wrapper around query_gaia_selected_backend.
+
+    Gaia DR3 is a frozen catalog: for the same WDS input file, a given query
+    role always returns the same rows. The cache key combines the query role,
+    the backend and a fingerprint of the input file.
+
+    Limitation: the fingerprint covers only the input file, not this source
+    code. If query parameters change (search radii, selected columns, Gaia
+    table), delete the cache/ directory manually before re-running.
+    """
+    role = ("displaced" if is_displaced else "raw") + ("_model" if model_sample else "_catalog")
+    fingerprint = _file_fingerprint(components_file)
+    cache_path = os.path.join(CACHE_DIR, f"gaia_{role}_{backend}_{fingerprint}.vot")
+
+    if os.path.exists(cache_path):
+        print(f"Cache hit: {cache_path}")
+        # VOTable is the same format the TAP service returns, so cached reads
+        # reproduce the column types of a live query exactly.
+        return Table.read(cache_path, format="votable")
+
+    table = query_gaia_selected_backend(
+        wds_df,
+        backend=backend,
+        is_displaced=is_displaced,
+        model_sample=model_sample,
+    )
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    # Remove stale entries for this role/backend (older input fingerprints).
+    for stale in glob.glob(os.path.join(CACHE_DIR, f"gaia_{role}_{backend}_*.vot")):
+        os.remove(stale)
+    # binary2 preserves masked (missing) values; FITS rejects the variable-length
+    # string columns returned by TAP.
+    table.write(cache_path, format="votable", tabledata_format="binary2")
+    print(f"Cache saved: {cache_path}")
+    return table
 
 
 # -----------------------------------------------------------------------------
@@ -2348,25 +2406,28 @@ def main(argv=None):
     print(f"Using Gaia query backend: {args.backend}")
 
     # 2. RAW MODEL sample to 15 arcsec, minimal Gaia columns.
-    raw_model_results = query_gaia_selected_backend(
+    raw_model_results = query_gaia_cached(
         wds_df,
         backend=args.backend,
+        components_file=args.components,
         is_displaced=False,
         model_sample=True,
     )
 
     # 3. DISPLACED MODEL sample to 15 arcsec, minimal Gaia columns.
-    disp_results = query_gaia_selected_backend(
+    disp_results = query_gaia_cached(
         wds_df,
         backend=args.backend,
+        components_file=args.components,
         is_displaced=True,
         model_sample=True,
     )
 
     # 4. RAW CATALOG candidates to 5 arcsec, retaining all Gaia columns.
-    raw_results = query_gaia_selected_backend(
+    raw_results = query_gaia_cached(
         wds_df,
         backend=args.backend,
+        components_file=args.components,
         is_displaced=False,
         model_sample=False,
     )
