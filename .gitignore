@@ -1,3 +1,6 @@
 \data
 \testing
 \outputs
+cache/
+referencia_extended/
+__pycache__/
