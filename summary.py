@@ -11,7 +11,8 @@ The output retains every WDS Summary field parsed by this script and adds:
 - pair-level parallax/proper-motion/radial-velocity consistency diagnostics,
 - projected separation and a simple WD/MS classification,
 - El-Badry et al. (2021) chance-alignment cross-reference when available, and
-- per-component WDS--Gaia proper-motion differences.
+- per-component WDS--Gaia proper-motion differences, and
+- absolute WDS/Gaia magnitude contrasts and WDS endpoint changes/rates.
 
 Inputs:
 - WDS Summary file (wdsweb_summ2.txt)
@@ -332,6 +333,74 @@ def _wds_pm_used(comp_data):
     return float(pmra), float(pmdec)
 
 
+def _finite_number(value):
+    """Parse a finite number, leaving absent, malformed or infinite inputs unset."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _pair_change_metrics(summary_data, c1, c2):
+    """Magnitude contrasts and endpoint changes; unavailable results stay blank.
+
+    WDS magnitudes come from the pair's original Summary row. Gaia magnitudes
+    are G-band values and require two globally assigned counterparts. PA is
+    the shortest circular difference (0--180 deg), without orbit unwrapping.
+    Separations are arcseconds; the WDS date fields are years. Each metric is
+    validated independently, so a missing PA does not discard a valid separation.
+    """
+    result = dict.fromkeys((
+        'delta_mag_wds', 'delta_mag_gaia', 'delta_pa_abs',
+        'delta_sep_abs', 'delta_pa_rate', 'delta_sep_rate',
+    ), '')
+
+    def abs_difference(first, last):
+        first, last = _finite_number(first), _finite_number(last)
+        if first is None or last is None:
+            return ''
+        value = abs(last - first)
+        return value if math.isfinite(value) else ''
+
+    result['delta_mag_wds'] = abs_difference(
+        summary_data.get('mag_pri'), summary_data.get('mag_sec')
+    )
+    if _has_gaia_match(c1) and _has_gaia_match(c2):
+        result['delta_mag_gaia'] = abs_difference(
+            _gaia_val(c1, 'phot_g_mean_mag'),
+            _gaia_val(c2, 'phot_g_mean_mag'),
+        )
+
+    pa_first = _finite_number(summary_data.get('pa_first'))
+    pa_last = _finite_number(summary_data.get('pa_last'))
+    if (pa_first is not None and pa_last is not None
+            and 0.0 <= pa_first <= 360.0 and 0.0 <= pa_last <= 360.0):
+        result['delta_pa_abs'] = abs((pa_last - pa_first + 180.0) % 360.0 - 180.0)
+
+    sep_first = _finite_number(summary_data.get('sep_first'))
+    sep_last = _finite_number(summary_data.get('sep_last'))
+    if (sep_first is not None and sep_last is not None
+            and sep_first >= 0.0 and sep_last >= 0.0):
+        result['delta_sep_abs'] = abs_difference(sep_first, sep_last)
+
+    num_obs = _finite_number(summary_data.get('num_obs'))
+    first_epoch = _finite_number(summary_data.get('date_first'))
+    last_epoch = _finite_number(summary_data.get('date_last'))
+    if (num_obs is not None and num_obs >= 2 and num_obs.is_integer()
+            and first_epoch is not None and last_epoch is not None
+            and first_epoch > 0.0 and last_epoch > first_epoch):
+        interval = last_epoch - first_epoch
+        if math.isfinite(interval):
+            for quantity in ('pa', 'sep'):
+                change = result[f'delta_{quantity}_abs']
+                if change != '':
+                    rate = change / interval
+                    if math.isfinite(rate):
+                        result[f'delta_{quantity}_rate'] = rate
+    return result
+
+
 def generate_summary_with_gaia(summary_path, crossmatch_path, output_path, elbadry_path=None):
     """ Core routine to merge WDS pairs with their Gaia properties. """
     print(f"Reading crossmatch from: {crossmatch_path}")
@@ -573,6 +642,7 @@ def generate_summary_with_gaia(summary_path, crossmatch_path, output_path, elbad
         # Gaia quantities. This guarantees that every WDS Summary-file column
         # parsed above is retained in the output catalog.
         result = dict(summary_data)
+        result.update(_pair_change_metrics(summary_data, c1, c2))
         result.update({
             'wds_id': summary_data['wds_id'],
             'discoverer': summary_data['discoverer'],
