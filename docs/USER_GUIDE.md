@@ -36,16 +36,12 @@ python3 crossmatch.py --components example_data/wds_components.summ.extended.txt
 
 | Option | Default | Description |
 | :--- | :--- | :--- |
-| `--components` | `./data/wds_components.summ.txt` | Input WDS component file |
+| `--components` | (always set it) | Input WDS component file, e.g. one of the samples in `example_data/` |
 | `--backend` | `ari` | Gaia TAP service: `ari` (ARI Heidelberg) or `esa` (ESA Gaia Archive) |
 | `--output` | `./outputs/components_crossmatch_bayesian.csv` | Final catalog, one row per component |
 | `--candidates` | `./outputs/components_crossmatch_candidates_scored.csv` | Every scored candidate within 5 arcsec |
 | `--model-summary` | `./outputs/components_crossmatch_model_summary.csv` | Per-stratum model diagnostics |
 | `--model-arrays` | `./outputs/components_crossmatch_model_arrays.npz` | Compressed model arrays |
-
-The production input `./data/wds_components.summ.txt` is not included in the
-repository. Use `--components` to point to your own file or to the samples in
-`example_data/`.
 
 ### 2.3. Example inputs
 
@@ -66,7 +62,15 @@ cache/gaia_raw_model_ari_8fdb05e3c362.vot
 ```
 
 On later runs with the same input file and backend, the program prints
-`Cache hit:` and reads the results from disk instead of querying Gaia.
+`Cache hit:` and reads the results from disk instead of querying Gaia. A query
+is saved only after all its batches finish, so an interrupted run does not leave
+partial files.
+
+When the input is large, each query is split into batches of 25,000 components
+and up to 5 batches are downloaded at the same time. The console shows lines
+such as `[ARI] Batch 3 / 12 matched ... sources.`; batches may finish in any
+order. The samples in `example_data/` fit in one batch, so they do not use
+parallel downloads.
 
 **Delete `cache/` manually** if you change query parameters in the code (search
 radii, selected Gaia columns or Gaia table). The fingerprint covers only the
@@ -196,9 +200,3 @@ components matched (`FULL`), one (`PARTIAL`) or none (`NONE`).
 
 Large values of `sigma_delta_parallax` or `delta_pm_norm` suggest that the two
 components may not form a physical binary.
-
----
-
-## 5. Checking results against a baseline
-
-`compare.py` compares `outputs/components_crossmatch_bayesian.csv`

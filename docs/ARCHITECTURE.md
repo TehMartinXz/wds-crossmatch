@@ -58,8 +58,10 @@ design decisions. For usage, see [`USER_GUIDE.md`](USER_GUIDE.md).
 
 ## 4. Gaia retrieval
 
-Three queries are sent through `TAP_UPLOAD`, in batches of 10,000 targets,
-with up to three retries per batch:
+Three queries are sent through `TAP_UPLOAD`. Each query is split into batches
+of 25,000 targets, and up to 5 batches are sent simultaneously
+(`MAX_TAP_THREADS`). Each batch is retried up to three times; if one batch
+fails after all retries, the whole query stops:
 
 | Query | Radius | Gaia columns | Purpose |
 | :--- | :--- | :--- | :--- |
@@ -71,9 +73,14 @@ with up to three retries per batch:
   spherical offset, as in Medan et al. (2021).
 - Two services are supported: ARI Heidelberg (default) and the ESA Gaia
   Archive. On ARI, the model queries use the lighter `gaia_source_lite` table.
+- Batches run in separate threads, but their results are stacked in batch
+  order, so the output (including `row_id`) is the same on every run.
+  Parallelism only helps when there is more than one batch: the extended sample
+  (3,409 components) fits in a single batch, while the full catalog (288,618
+  components) needs 12.
 - `query_gaia_cached` wraps the queries with an on-disk cache in VOTable
   (`binary2`) format, which preserves the column types and missing values of a
-  live query.
+  live query. A query is cached only after all its batches finish.
 
 ---
 
@@ -105,8 +112,8 @@ latitude `|b|` × 6 bins of WDS magnitude.
    the negative-residual curve, found with a broken-line fit.
 3. **Smoothing.** Both histograms are smoothed with
    `percentile_filter(percentile=60, size=5)`.
-4. **Signal (H1).** The scaled background is subtracted from the RAW histogram;
-   negative cells are set to zero.
+4. **Signal (H1).** The smoothed scaled background is subtracted from the
+   smoothed RAW histogram; negative cells are set to zero.
 5. **Priors and posterior.** `P1` is the signal fraction and `P0 = 1 − P1`.
    The posterior in each cell is `f1·P1 / (f1·P1 + f0·P0)`. Cells with no
    support under either hypothesis are left undefined.
@@ -133,6 +140,8 @@ is kept, and BIC selects the count. Every attempt is recorded in
 `score_candidates` assigns each candidate within 5 arcsec the posterior of the
 cell it falls into, using the 2-D, θ-only or `|b|`-only model as described in
 section 5.4. It also stores the log-odds, clipped to avoid infinite values.
+The histogram-bin lookup is vectorized with NumPy over all candidates at once,
+instead of looping row by row.
 
 ---
 
@@ -172,7 +181,9 @@ output assembly, because converting them to floating point would round many
 
 ## 9. Performance
 
-On the extended sample, profiling shows that about 92% of the runtime is spent
-in `build_empirical_bayesian_models`, mostly inside `scipy.optimize.least_squares`
-fitting the Gaussian mixtures. Candidate scoring and assignment together take a
-few seconds. The disk cache removes the network wait on repeated runs.
+Profiling on the extended sample showed that most of the runtime is spent in
+`build_empirical_bayesian_models`, mostly inside `scipy.optimize.least_squares`
+fitting the Gaussian mixtures. Candidate scoring and assignment take a small
+fraction of the total. Parallel downloads and the disk cache reduce only the
+network wait, which is why they do not change the overall runtime much on small
+inputs.

@@ -42,7 +42,9 @@ df = summary.generate_summary_with_gaia(
 | Constant | Value | Meaning |
 | :--- | :--- | :--- |
 | `DEFAULT_GAIA_BACKEND` | `"ari"` | Default Gaia TAP service |
-| `ARI_BATCH_SIZE`, `ESA_BATCH_SIZE` | `10000` | Targets per `TAP_UPLOAD` batch |
+| `ARI_BATCH_SIZE`, `ESA_BATCH_SIZE` | `25000` | Targets per `TAP_UPLOAD` batch |
+| `MAX_TAP_THREADS` | `5` | Maximum simultaneous `TAP_UPLOAD` requests |
+| `ARI_TAP_URL` | `"https://gaia.ari.uni-heidelberg.de/tap"` | ARI Heidelberg TAP endpoint |
 | `MODEL_RADIUS_ARCSEC` | `15.0` | Radius of the calibration queries |
 | `ASSIGNMENT_RADIUS_ARCSEC` | `5.0` | Radius of final candidate eligibility |
 | `displacement_deg` | `2/60` | Offset of the displaced control field (2 arcmin) |
@@ -92,8 +94,8 @@ Same query without cache; dispatches to the ARI or ESA function.
 - **Raises:** `ValueError` for an unknown backend.
 
 #### `query_gaia_batches_ari(...)` and `query_gaia_batches_esa(...)`
-Send the `TAP_UPLOAD` query in batches, with three retries per batch.
-- **Raises:** `RuntimeError` if a batch fails after all retries.
+Split the upload table into batches of `ARI_BATCH_SIZE` / `ESA_BATCH_SIZE` targets and send up to `MAX_TAP_THREADS` of them at the same time with a `ThreadPoolExecutor`. Results are stacked in batch order, so the output is deterministic. Each batch is retried up to three times (10 s apart) inside its worker.
+- **Raises:** `RuntimeError` if a batch fails after all retries; the whole query is aborted.
 
 ### 2.4. Model construction
 
