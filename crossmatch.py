@@ -111,6 +111,7 @@ import warnings
 import re
 import hashlib
 import glob
+import concurrent.futures
 
 from astroquery.gaia import Gaia
 from astroquery.utils.tap.core import TapPlus
@@ -140,24 +141,23 @@ DETERMINISTIC_START_SPECS = [
 ]
 FIT_AUDIT = []
 ARI_TAP_URL = "https://gaia.ari.uni-heidelberg.de/tap"
-ARI_BATCH_SIZE = 10000
-ESA_BATCH_SIZE = 10000
 
-# Enable testing mode
+# Multithreading and TAP Limits Optimized
+ARI_BATCH_SIZE = 25000
+ESA_BATCH_SIZE = 25000
+MAX_TAP_THREADS = 5
+
 test = False
 
 DEFAULT_COMPONENTS_FILE = "./data/wds_components.summ.txt"
+
+if test:
+    DEFAULT_COMPONENTS_FILE = "./example_data/wds_components.summ.extended.txt"
+
 DEFAULT_OUTPUT_FILE = "./outputs/components_crossmatch_bayesian.csv"
 DEFAULT_CANDIDATE_OUTPUT_FILE = "./outputs/components_crossmatch_candidates_scored.csv"
 DEFAULT_MODEL_SUMMARY_FILE = "./outputs/components_crossmatch_model_summary.csv"
 DEFAULT_MODEL_ARRAYS_FILE = "./outputs/components_crossmatch_model_arrays.npz"
-
-if test:
-    DEFAULT_COMPONENTS_FILE = "./example_data/wds_components.summ.extended.txt"
-    DEFAULT_OUTPUT_FILE = "./example_outputs/components_crossmatch_bayesian.csv"
-    DEFAULT_CANDIDATE_OUTPUT_FILE = "./example_outputs/components_crossmatch_candidates_scored.csv"
-    DEFAULT_MODEL_SUMMARY_FILE = "./example_outputs/components_crossmatch_model_summary.csv"
-    DEFAULT_MODEL_ARRAYS_FILE = "./example_outputs/components_crossmatch_model_arrays.npz"
 
 gaia_epoch = 2016.0
 wds_epoch = 2000.0
@@ -447,20 +447,12 @@ def propagate_coordinates(wds_df):
 def get_displaced_coordinates(ra_deg, dec_deg):
     """
     Apply the Medan et al. (2021) 2-arcmin displaced-control offset.
-
-    The RELEASED Medan cross_match_dis() code shifts northern targets by
-    -2 arcmin in declination and southern targets by +2 arcmin: i.e. TOWARD
-    the celestial equator. We reproduce that sign convention, but use a
-    spherical meridional offset so the geometry remains valid everywhere.
     """
     ra_deg = np.asarray(ra_deg, dtype=float)
     dec_deg = np.asarray(dec_deg, dtype=float)
 
     coords = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
 
-    # Position angle 180 deg = south for northern targets; 0 deg = north for
-    # southern targets. At dec=0, choose south; the distinction is immaterial
-    # to the local-control construction but makes the convention deterministic.
     position_angle = np.where(dec_deg >= 0.0, 180.0, 0.0) * u.deg
     displaced = coords.directional_offset_by(
         position_angle,
@@ -469,20 +461,43 @@ def get_displaced_coordinates(ra_deg, dec_deg):
 
     return displaced.ra.deg, displaced.dec.deg
 
+def _worker_esa(batch_table, radius_deg, gaia_select, batch_num, n_batches):
+    """Thread worker for ESA async queries."""
+    adql_query = f"""
+    SELECT
+        u.upload_id, u.wds_id, u.component, u.wds_mag, u.gal_b,
+        {gaia_select},
+        DISTANCE(
+            POINT('ICRS', u.ra_target, u.dec_target),
+            POINT('ICRS', g.ra, g.dec)
+        ) * 3600.0 AS dist_arcsec
+    FROM TAP_UPLOAD.my_table AS u
+    JOIN gaiadr3.gaia_source AS g
+    ON 1 = CONTAINS(
+        POINT('ICRS', u.ra_target, u.dec_target),
+        CIRCLE('ICRS', g.ra, g.dec, {radius_deg})
+    )
+    """
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            job = Gaia.launch_job_async(
+                query=adql_query,
+                upload_resource=batch_table,
+                upload_table_name="my_table"
+            )
+            batch_results = job.get_results()
+            print(f"  [ESA] Batch {batch_num} / {n_batches} matched {len(batch_results)} sources.")
+            return batch_results
+        except Exception as exc:
+            print(f"  ESA error on Batch {batch_num}: {exc}. Retrying {attempt + 1}/{max_retries}...")
+            time.sleep(10)
+            if attempt == max_retries - 1:
+                raise RuntimeError(f"ESA Gaia TAP failed on batch {batch_num}.") from exc
+
 
 def query_gaia_batches_esa(wds_df, is_displaced=False, model_sample=False):
-    """
-    Query the ESA Gaia Archive with TAP_UPLOAD and return WDS--Gaia candidate pairs.
-
-    Three roles are supported:
-      RAW catalog candidates: 5 arcsec, g.* retained for the final product.
-      RAW model sample:       15 arcsec, minimal Gaia columns only.
-      DISPLACED model sample: 15 arcsec, minimal Gaia columns only.
-
-    Splitting RAW-model and RAW-catalog retrieval preserves the exact Bayesian
-    training sample while avoiding transfer of every Gaia DR3 column for the
-    5--15 arcsec background-dominated annulus.
-    """
+    """Multithreaded ESA Gaia Archive Query."""
     df_upload = wds_df[
         ["upload_id", "wds_id", "component", "ra_j2016", "dec_j2016", "wds_mag", "gal_b"]
     ].copy()
@@ -515,8 +530,7 @@ def query_gaia_batches_esa(wds_df, is_displaced=False, model_sample=False):
         mode_str = "RAW CATALOG (5 arcsec, full Gaia output)"
 
     batch_size = ESA_BATCH_SIZE
-    all_results = []
-    print(f"\n--- Starting Gaia TAP Queries from ESA: {mode_str} ---")
+    print(f"\n--- Starting Parallel Gaia TAP Queries from ESA: {mode_str} ---")
 
     gaia_select = (
         "g.*"
@@ -527,50 +541,20 @@ def query_gaia_batches_esa(wds_df, is_displaced=False, model_sample=False):
     if not full_gaia_columns:
         print("Model query: requesting minimal Gaia columns only.")
 
-    for i in range(0, len(upload_table), batch_size):
-        batch_table = upload_table[i:i + batch_size]
-
-        adql_query = f"""
-        SELECT
-            u.upload_id, u.wds_id, u.component, u.wds_mag, u.gal_b,
-            {gaia_select},
-            DISTANCE(
-                POINT('ICRS', u.ra_target, u.dec_target),
-                POINT('ICRS', g.ra, g.dec)
-            ) * 3600.0 AS dist_arcsec
-        FROM TAP_UPLOAD.my_table AS u
-        JOIN gaiadr3.gaia_source AS g
-        ON 1 = CONTAINS(
-            POINT('ICRS', u.ra_target, u.dec_target),
-            CIRCLE('ICRS', g.ra, g.dec, {radius_deg})
-        )
-        """
-
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                job = Gaia.launch_job_async(
-                    query=adql_query,
-                    upload_resource=batch_table,
-                    upload_table_name="my_table"
-                )
-                batch_results = job.get_results()
-                all_results.append(batch_results)
-                print(
-                    f"Batch {(i // batch_size) + 1} / "
-                    f"{int(np.ceil(len(upload_table) / batch_size))} "
-                    f"matched {len(batch_results)} sources."
-                )
-                break
-            except Exception as exc:
-                print(
-                    f"  Error: {exc}. Retrying {attempt + 1}/{max_retries} in 10 seconds..."
-                )
-                time.sleep(10)
-                if attempt == max_retries - 1:
-                    raise RuntimeError(
-                        "Failed to reach Gaia TAP server after max retries."
-                    ) from exc
+    n_batches = int(np.ceil(len(upload_table) / batch_size))
+    all_results = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_TAP_THREADS) as executor:
+        futures = []
+        for i in range(0, len(upload_table), batch_size):
+            batch_table = upload_table[i:i + batch_size]
+            batch_num = (i // batch_size) + 1
+            futures.append(
+                executor.submit(_worker_esa, batch_table, radius_deg, gaia_select, batch_num, n_batches)
+            )
+            
+        for future in concurrent.futures.as_completed(futures):
+            all_results.append(future.result())
 
     if not all_results:
         return Table()
@@ -580,21 +564,44 @@ def query_gaia_batches_esa(wds_df, is_displaced=False, model_sample=False):
     return stacked_table
 
 
+def _worker_ari(batch_table, radius_deg, gaia_select, gaia_table, batch_num, n_batches):
+    """Thread worker for ARI Heidelberg async queries."""
+    tap = TapPlus(url=ARI_TAP_URL)
+    adql_query = f"""
+    SELECT
+        u.upload_id, u.wds_id, u.component, u.wds_mag, u.gal_b,
+        {gaia_select},
+        DISTANCE(
+            POINT('', g.ra, g.dec),
+            POINT('', u.ra_target, u.dec_target)
+        ) * 3600.0 AS dist_arcsec
+    FROM TAP_UPLOAD.my_table AS u
+    JOIN {gaia_table} AS g
+    ON CONTAINS(
+        POINT('', g.ra, g.dec),
+        CIRCLE('', u.ra_target, u.dec_target, {radius_deg:.12f})
+    ) = 1
+    """
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            job = tap.launch_job_async(
+                query=adql_query,
+                upload_resource=batch_table,
+                upload_table_name="my_table"
+            )
+            batch_results = job.get_results()
+            print(f"  [ARI] Batch {batch_num} / {n_batches} matched {len(batch_results)} sources.")
+            return batch_results
+        except Exception as exc:
+            print(f"  ARI error on Batch {batch_num}: {exc}. Retrying {attempt + 1}/{max_retries}...")
+            time.sleep(10)
+            if attempt == max_retries - 1:
+                raise RuntimeError(f"ARI Gaia TAP failed on batch {batch_num} after {max_retries} attempts.") from exc
+
 
 def query_gaia_batches_ari(wds_df, is_displaced=False, model_sample=False):
-    """
-    Query the ARI Heidelberg Gaia TAP mirror using standard TAP_UPLOAD.
-
-    ARI explicitly supports user-table uploads and positional crossmatches.  The
-    uploaded WDS table is the small side of the JOIN, while Gaia is the POINT and
-    each uploaded WDS position defines the CIRCLE, matching ARI's documented
-    optimization guidance.
-
-    Model samples use ``gaiadr3.gaia_source_lite`` because only source_id, ra,
-    dec and phot_g_mean_mag are needed.  The final <=5-arcsec candidate query uses
-    the full ``gaiadr3.gaia_source`` table so the output can retain every Gaia
-    source column, exactly as with the ESA backend.
-    """
+    """Multithreaded ARI Heidelberg Gaia TAP Query."""
     df_upload = wds_df[
         ["upload_id", "wds_id", "component", "ra_j2016", "dec_j2016", "wds_mag", "gal_b"]
     ].copy()
@@ -626,10 +633,8 @@ def query_gaia_batches_ari(wds_df, is_displaced=False, model_sample=False):
         full_gaia_columns = True
         mode_str = "RAW CATALOG (5 arcsec, full Gaia output)"
 
-    tap = TapPlus(url=ARI_TAP_URL)
     batch_size = ARI_BATCH_SIZE
-    all_results = []
-
+    
     gaia_table = (
         "gaiadr3.gaia_source"
         if full_gaia_columns
@@ -641,60 +646,25 @@ def query_gaia_batches_ari(wds_df, is_displaced=False, model_sample=False):
         else "g.source_id, g.ra, g.dec, g.phot_g_mean_mag"
     )
 
-    print(f"\n--- Starting Gaia TAP Queries from ARI Heidelberg: {mode_str} ---")
-    print(f"ARI table: {gaia_table}; TAP_UPLOAD batch size: {batch_size}")
+    print(f"\n--- Starting Parallel Gaia TAP Queries from ARI Heidelberg: {mode_str} ---")
+    print(f"ARI table: {gaia_table}; TAP_UPLOAD batch size: {batch_size}; Workers: {MAX_TAP_THREADS}")
     if not full_gaia_columns:
         print("Model query: requesting minimal Gaia columns from gaia_source_lite.")
 
     n_batches = int(np.ceil(len(upload_table) / batch_size))
-    for i in range(0, len(upload_table), batch_size):
-        batch_table = upload_table[i:i + batch_size]
-        batch_num = (i // batch_size) + 1
-
-        # ARI recommends: smallest table first in JOIN; Gaia sources as POINT;
-        # uploaded/input positions as CIRCLE centers.
-        adql_query = f"""
-        SELECT
-            u.upload_id, u.wds_id, u.component, u.wds_mag, u.gal_b,
-            {gaia_select},
-            DISTANCE(
-                POINT('', g.ra, g.dec),
-                POINT('', u.ra_target, u.dec_target)
-            ) * 3600.0 AS dist_arcsec
-        FROM TAP_UPLOAD.my_table AS u
-        JOIN {gaia_table} AS g
-        ON CONTAINS(
-            POINT('', g.ra, g.dec),
-            CIRCLE('', u.ra_target, u.dec_target, {radius_deg:.12f})
-        ) = 1
-        """
-
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                job = tap.launch_job_async(
-                    query=adql_query,
-                    upload_resource=batch_table,
-                    upload_table_name="my_table"
-                )
-                batch_results = job.get_results()
-                all_results.append(batch_results)
-                print(
-                    f"Batch {batch_num} / {n_batches} "
-                    f"matched {len(batch_results)} sources."
-                )
-                break
-            except Exception as exc:
-                print(
-                    f"  ARI error on Batch {batch_num}: {exc}. "
-                    f"Retrying {attempt + 1}/{max_retries} in 10 seconds..."
-                )
-                time.sleep(10)
-                if attempt == max_retries - 1:
-                    raise RuntimeError(
-                        f"ARI Gaia TAP failed on batch {batch_num} after "
-                        f"{max_retries} attempts."
-                    ) from exc
+    all_results = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_TAP_THREADS) as executor:
+        futures = []
+        for i in range(0, len(upload_table), batch_size):
+            batch_table = upload_table[i:i + batch_size]
+            batch_num = (i // batch_size) + 1
+            futures.append(
+                executor.submit(_worker_ari, batch_table, radius_deg, gaia_select, gaia_table, batch_num, n_batches)
+            )
+            
+        for future in concurrent.futures.as_completed(futures):
+            all_results.append(future.result())
 
     if not all_results:
         return Table()
@@ -702,6 +672,7 @@ def query_gaia_batches_ari(wds_df, is_displaced=False, model_sample=False):
     stacked_table = vstack(all_results, metadata_conflicts="silent")
     stacked_table["row_id"] = np.arange(len(stacked_table))
     return stacked_table
+
 
 def query_gaia_selected_backend(wds_df, backend, is_displaced=False, model_sample=False):
     """Dispatch one Gaia query stage to ARI Heidelberg or the ESA Gaia Archive."""
@@ -1717,19 +1688,10 @@ def get_hist_bin(value, bins):
 def score_candidates(raw_table, model_bundle):
     """
     Evaluate every RAW candidate with a Medan-style pairwise posterior.
-
-    Cases
-    -----
-    1. m_WDS and Gaia G available:
-       use the full 2-D (theta, G-m_WDS) model in the known (m_WDS, |b|) stratum.
-    2. m_WDS available but Gaia G missing:
-       use the independently calibrated theta-only model for the same
-       (m_WDS, |b|) stratum. Its training sample does not condition on finite G.
-    3. m_WDS missing:
-       use the |b|-only complete-six-stratum theta-model mixture, if available.
-
-    Finite-G quasi-colors must lie inside the frozen production support.
-    Cells with zero support under both H1 and H0 remain unmodeled (NaN).
+    
+    VECTORIZED VERSION:
+    Replaces iteration with boolean masking and numpy array mapping for
+    drastic performance improvements on the full WDS catalog.
     """
     raw_df = raw_table.to_pandas().copy() if isinstance(raw_table, Table) else raw_table.copy()
 
@@ -1748,102 +1710,122 @@ def score_candidates(raw_table, model_bundle):
         pd.to_numeric(raw_df["dist_arcsec"], errors="coerce") <= ASSIGNMENT_RADIUS_ARCSEC
     )
 
-    for idx, row in raw_df.iterrows():
-        b_abs = abs(float(row["gal_b"])) if np.isfinite(row["gal_b"]) else np.nan
-        b_key = get_b_key(b_abs)
-        if b_key is None:
-            continue
+    def vectorize_get_hist_bin(values, bins):
+        """Vectorized equivalent of get_hist_bin using np.digitize."""
+        idx = np.digitize(values, bins) - 1
+        finite_mask = np.isfinite(values)
+        
+        is_right_edge = np.zeros_like(values, dtype=bool)
+        is_right_edge[finite_mask] = np.isclose(values[finite_mask], bins[-1])
+        
+        idx[is_right_edge] = len(bins) - 2
+        idx[(idx < 0) | (idx >= len(bins) - 1) | ~finite_mask] = -1
+        return idx
 
-        dist_idx = get_hist_bin(float(row["dist_arcsec"]), dist_bins)
-        if dist_idx is None:
-            continue
+    # Extract columns as fast numpy arrays
+    dist_arcsec = pd.to_numeric(raw_df["dist_arcsec"], errors="coerce").to_numpy(float)
+    wds_mag = pd.to_numeric(raw_df.get("wds_mag", np.nan), errors="coerce").to_numpy(float)
+    g_mag = pd.to_numeric(raw_df.get("phot_g_mean_mag", np.nan), errors="coerce").to_numpy(float)
+    b_abs = np.abs(pd.to_numeric(raw_df.get("gal_b", np.nan), errors="coerce").to_numpy(float))
 
-        try:
-            wds_mag = float(row.get("wds_mag", np.nan))
-        except (TypeError, ValueError):
-            wds_mag = np.nan
+    has_wds_mag = np.isfinite(wds_mag) & (wds_mag != 1234.0)
+    has_gaia_g = np.isfinite(g_mag)
 
-        try:
-            g_mag = float(row.get("phot_g_mean_mag", np.nan))
-        except (TypeError, ValueError):
-            g_mag = np.nan
+    quasi_color = g_mag - wds_mag
+    
+    dist_idx_arr = vectorize_get_hist_bin(dist_arcsec, dist_bins)
+    mag_idx_arr = vectorize_get_hist_bin(quasi_color, dmag_bins)
+    valid_dist_mask = (dist_idx_arr != -1)
 
-        has_wds_mag = np.isfinite(wds_mag) and wds_mag != 1234.0
-        has_gaia_g = np.isfinite(g_mag)
-
-        if has_wds_mag:
-            mag_key = get_wds_mag_key(wds_mag)
-            if mag_key is None:
-                continue
-
-            if has_gaia_g:
-                model_2d = models_2d.get((*b_key, *mag_key))
-                if model_2d is None:
-                    continue
-
-                q = g_mag - wds_mag
-                raw_df.at[idx, "quasi_color"] = q
-
-                mag_idx = get_hist_bin(q, dmag_bins)
-                if mag_idx is None:
-                    # The fixed production support is an explicit model boundary.
-                    # Never hide a support error with a theta-only fallback.
-                    raise RuntimeError(
-                        f"Candidate q={q:.6f} lies outside the configured quasi-color "
-                        f"support [{dmag_bins[0]}, {dmag_bins[-1]}]."
+    for b_min, b_max in b_bins:
+        b_mask = (b_abs >= b_min) & (b_abs < b_max)
+        
+        # 1. 1D |b|-only models (missing wds_mag)
+        mask_1d_b = b_mask & ~has_wds_mag & valid_dist_mask
+        if np.any(mask_1d_b):
+            b_key = (b_min, b_max)
+            model_1d = models_1d_b.get(b_key)
+            if model_1d is not None:
+                valid_dist_idx = dist_idx_arr[mask_1d_b]
+                posteriors = model_1d["bayes_1d"][valid_dist_idx]
+                
+                finite_mask = np.isfinite(posteriors)
+                if np.any(finite_mask):
+                    update_mask = mask_1d_b.copy()
+                    update_mask[mask_1d_b] = finite_mask
+                    
+                    raw_df.loc[update_mask, "posterior_prob"] = posteriors[finite_mask]
+                    raw_df.loc[update_mask, "model_prior_H1"] = model_1d["prior_H1"]
+                    raw_df.loc[update_mask, "model_prior_H0"] = model_1d["prior_H0"]
+                    raw_df.loc[update_mask, "scale_S"] = model_1d["scale_S"]
+                    raw_df.loc[update_mask, "bayes_model"] = np.where(
+                        has_gaia_g[update_mask], 
+                        "1D_b_missing_WDS_mag", 
+                        "1D_b_missing_WDS_and_G"
                     )
 
-                posterior = model_2d["bayes_2d"][dist_idx, mag_idx]
-                prior_H1 = model_2d["prior_H1"]
-                prior_H0 = model_2d["prior_H0"]
-                scale_S = model_2d["scale_S"]
-                model_name = "2D_WDSref"
-            else:
-                model_theta = models_theta.get((*b_key, *mag_key))
-                if model_theta is None:
-                    continue
+        # 2. Iterate over WDS magnitude strata
+        for mag_min, mag_max in wds_mag_strata:
+            key = (b_min, b_max, mag_min, mag_max)
+            base_mask = b_mask & has_wds_mag & (wds_mag >= mag_min) & (wds_mag < mag_max) & valid_dist_mask
+            
+            # 2A. 2D Models (has wds_mag and has gaia_g)
+            mask_2d = base_mask & has_gaia_g
+            if np.any(mask_2d):
+                model_2d = models_2d.get(key)
+                if model_2d is not None:
+                    raw_df.loc[mask_2d, "quasi_color"] = quasi_color[mask_2d]
 
-                posterior = model_theta["bayes_1d"][dist_idx]
-                prior_H1 = model_theta["prior_H1"]
-                prior_H0 = model_theta["prior_H0"]
-                scale_S = model_theta["scale_S"]
-                model_name = "1D_magb_missing_G_theta_calibrated"
+                    invalid_q = mask_2d & (mag_idx_arr == -1)
+                    if np.any(invalid_q):
+                        q_invalid_val = quasi_color[invalid_q][0]
+                        raise RuntimeError(
+                            f"Candidate q={q_invalid_val:.6f} lies outside the configured quasi-color "
+                            f"support [{dmag_bins[0]}, {dmag_bins[-1]}]."
+                        )
+                    
+                    valid_dist_idx = dist_idx_arr[mask_2d]
+                    valid_mag_idx = mag_idx_arr[mask_2d]
+                    
+                    posteriors = model_2d["bayes_2d"][valid_dist_idx, valid_mag_idx]
+                    finite_mask = np.isfinite(posteriors)
+                    
+                    if np.any(finite_mask):
+                        update_mask = mask_2d.copy()
+                        update_mask[mask_2d] = finite_mask
+                        
+                        raw_df.loc[update_mask, "posterior_prob"] = posteriors[finite_mask]
+                        raw_df.loc[update_mask, "model_prior_H1"] = model_2d["prior_H1"]
+                        raw_df.loc[update_mask, "model_prior_H0"] = model_2d["prior_H0"]
+                        raw_df.loc[update_mask, "scale_S"] = model_2d["scale_S"]
+                        raw_df.loc[update_mask, "bayes_model"] = "2D_WDSref"
 
-        else:
-            # Without m_WDS the reference-magnitude stratum is unknown. Use the
-            # complete six-stratum |b|-only mixture, if it was constructible.
-            model_1d = models_1d_b.get(b_key)
-            if model_1d is None:
-                continue
+            # 2B. Theta Models (has wds_mag but missing gaia_g)
+            mask_theta = base_mask & ~has_gaia_g
+            if np.any(mask_theta):
+                model_theta = models_theta.get(key)
+                if model_theta is not None:
+                    valid_dist_idx = dist_idx_arr[mask_theta]
+                    posteriors = model_theta["bayes_1d"][valid_dist_idx]
+                    
+                    finite_mask = np.isfinite(posteriors)
+                    if np.any(finite_mask):
+                        update_mask = mask_theta.copy()
+                        update_mask[mask_theta] = finite_mask
+                        
+                        raw_df.loc[update_mask, "posterior_prob"] = posteriors[finite_mask]
+                        raw_df.loc[update_mask, "model_prior_H1"] = model_theta["prior_H1"]
+                        raw_df.loc[update_mask, "model_prior_H0"] = model_theta["prior_H0"]
+                        raw_df.loc[update_mask, "scale_S"] = model_theta["scale_S"]
+                        raw_df.loc[update_mask, "bayes_model"] = "1D_magb_missing_G_theta_calibrated"
 
-            posterior = model_1d["bayes_1d"][dist_idx]
-            prior_H1 = model_1d["prior_H1"]
-            prior_H0 = model_1d["prior_H0"]
-            scale_S = model_1d["scale_S"]
-            model_name = (
-                "1D_b_missing_WDS_mag"
-                if has_gaia_g else
-                "1D_b_missing_WDS_and_G"
-            )
-
-        # A NaN posterior denotes a bin with no empirical support under either
-        # H1 or H0. Leave the candidate explicitly unmodeled.
-        if not np.isfinite(posterior):
-            continue
-
-        posterior = float(posterior)
-        utility_posterior = float(np.clip(posterior, 1e-12, 1.0 - 1e-12))
-        log_odds = np.log(utility_posterior) - np.log1p(-utility_posterior)
-
-        # Keep the empirical posterior itself unchanged (including exact 0 or 1).
-        # Only the assignment utility is numerically regularized to avoid infinite
-        # log-odds at the boundaries.
-        raw_df.at[idx, "posterior_prob"] = posterior
-        raw_df.at[idx, "log_odds"] = log_odds
-        raw_df.at[idx, "bayes_model"] = model_name
-        raw_df.at[idx, "model_prior_H1"] = prior_H1
-        raw_df.at[idx, "model_prior_H0"] = prior_H0
-        raw_df.at[idx, "scale_S"] = scale_S
+    # 3. Calculate log_odds mathematically using array operations
+    valid_posteriors = raw_df["posterior_prob"].notna()
+    if valid_posteriors.any():
+        post_probs = raw_df.loc[valid_posteriors, "posterior_prob"].to_numpy()
+        utility = np.clip(post_probs, 1e-12, 1.0 - 1e-12)
+        log_odds = np.log(utility) - np.log1p(-utility)
+        raw_df.loc[valid_posteriors, "log_odds"] = log_odds
 
     return raw_df
 
