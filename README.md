@@ -5,6 +5,11 @@ Quick description: This is an attempt to crossmatch every component of the Washi
 
 > Note: This repository only contains a technical description of the code used in this project. A short scientific description is available in the poster we presented at the XXI SOCHIAS Annual Meeting. Further details of our methods will be mentioned in the project's paper (in-preparation).
 
+Acknowledgements:
+This research has made use of the Washington Double Star Catalog maintained at the U.S. Naval Observatory. This work has also made use of data from the European Space Agency (ESA) mission Gaia (https://www.cosmos.esa.int/gaia), processed by the Gaia Data Processing and Analysis Consortium (DPAC, https://www.cosmos.esa.int/web/gaia/dpac/consortium). Funding for the DPAC has been provided by national institutions, in particular the institutions participating in the Gaia Multilateral Agreement.
+
+This work was made by the AstroKern student initivative collaboration at Universidad Técnica Federico Santa María (UTFSM), Santiago, Chile. We thank the "Fondos Concursables 2026-1" by the DREE at UTFSM for financially supporting AstroKern.
+
 ## Table of Contents
 1. [Quick Start](#1-quick-start)
    1.1. [Installation](#11-installation)
