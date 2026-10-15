@@ -171,9 +171,14 @@ Which empirical model scored each candidate:
 | `--elbadry` | `./data/all_columns_catalog.fits` | El-Badry et al. (2021) catalog (optional) |
 | `--skip-elbadry` | off | Skip the El-Badry cross-reference |
 
-The WDS Summary file and the El-Badry catalog are not included in the
+The WDS Summary file, the WDS components file, and the El-Badry catalog are not included in the
 repository; obtain them separately and place them in `data/`. Only WDS systems
 present in the crossmatch output are processed.
+
+Download links:
+- El-Badry catalog: https://zenodo.org/records/4435257
+- WDS Components file: https://www.astro.gsu.edu/wds/Webtextfiles/wds_precise.txt
+- WDS Summary file: https://www.astro.gsu.edu/wds/Webtextfiles/wdsweb_summ2.txt
 
 ### 4.2. Basic run
 

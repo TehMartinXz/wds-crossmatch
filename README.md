@@ -3,6 +3,8 @@ Repository for the project: "A Statistical View of the Washington Double Star Ca
 
 Quick description: This is an attempt to crossmatch every component of the Washington Double Star Catalog (WDS) to a Gaia DR3 source. The base crossmatching work (including the Summary file generation) was originally made for the [AstraKairos project](https://github.com/AstraKairos/astrakairos), which consisted of a simple weight system to assign a crossmatching confidence value based on the distance between a WDS coordinate and a Gaia DR3 source, as well as the magnitude difference between these catalogs. For this work, we opted for a more statistically-sound method by updating the per-component matching logic to include adaptations of the Bayesian crossmatching algorithm presented by [Medan et al.](https://doi.org/10.3847/1538-3881/abe878) as well as the Hungarian algorithm optimization shown by [Budavári & Basu](http://dx.doi.org/10.3847/0004-6256/152/4/86) (B&B's method was used as an attempt to partially solve the multiplicity problem mentioned in Medan's work).
 
+> Note: This repository only contains a technical description of the code used in this project. A short scientific description is available in the poster we presented at the XXI SOCHIAS Annual Meeting. Further details of our methods will be mentioned in the project's paper (in-preparation).
+
 ## Table of Contents
 1. [Quick Start](#1-quick-start)
    1.1. [Installation](#11-installation)
@@ -34,7 +36,7 @@ Tested with Python 3.13. See [`docs/INSTALLATION.md`](docs/INSTALLATION.md) for 
 python3 crossmatch.py --components example_data/wds_components.summ.extended.txt
 ```
 
-The first run queries Gaia DR3 and takes a few minutes. Query results are cached in `cache/`, so later runs on the same input file skip the Gaia queries.
+The first run queries Gaia DR3 and takes a few minutes. Query results are cached in `cache/`, so later runs on the same input file skip the Gaia queries. This feature was added to speed-up the testing process.
 
 ### 1.3. What You Get
 
@@ -45,7 +47,9 @@ The main output is `outputs/components_crossmatch_bayesian.csv`, with one row pe
 - `best_posterior_prob`: highest pairwise association probability among eligible candidates, in [0, 1]
 - `assignment_status`: one of `assigned_global`, `not_assigned_global`, `no_modeled_candidate`
 
-Result on the extended sample (3,409 components):
+> Note: The components output file also includes all gaiadr3.gaia_source columns for ease of use.
+
+Validation: Results on the extended test sample (3,409 WDS components):
 
 | `assignment_status` | Components | % |
 | :--- | ---: | ---: |
@@ -57,40 +61,36 @@ Additional outputs in `outputs/`: the scored candidate table, per-stratum model 
 
 ## 2. What It Does
 
-wds-crossmatch matches WDS components to their Gaia DR3 counterparts when several candidates lie nearby:
+crossmatch.py matches WDS components to their most likely Gaia DR3 counterparts, even when several candidates lie nearby:
 
 - **Reads:** a WDS component list and propagates coordinates from epoch 2000.0 to the Gaia epoch 2016.0.
 - **Queries:** Gaia DR3 within 15 arcsec (plus a displaced control field) to calibrate the statistical model, and within 5 arcsec to collect final candidates.
 - **Scores:** each candidate with an empirical Bayesian association probability, following Medan et al. (2021).
 - **Assigns:** components to Gaia sources one to one, resolving competing matches with the assignment formalism of Budavári & Basu (2016).
 
-`summary.py` then combines the WDS pairs with the assigned Gaia counterparts and adds pair-level diagnostics (parallax, proper-motion and radial-velocity consistency, and an optional cross-reference with El-Badry et al. 2021).
+`summary.py` then combines the WDS pairs with the assigned Gaia counterparts and adds pair-level diagnostics, including: parallax, proper-motion and radial-velocity consistency, and an optional additional cross-reference with "A million binaries from Gaia eDR3" (El-Badry et al. 2021). This outputs .csv and .xlsx summary files.
 
 ## 3. Key Features
 
 | Feature | Benefit |
 | :--- | :--- |
-| **Empirical Bayesian model** | Quantified association probability, not just "closest source" |
+| **Empirical Bayesian model** | Bayesian association probability (Medan et al., 2021) |
 | **Global one-to-one assignment** | Resolves competing matches (Budavári & Basu, 2016) |
 | **Disk cache** | Repeated runs reuse Gaia query results instead of querying Gaia again |
-| **Parallel Gaia downloads** | Up to 5 simultaneous `TAP_UPLOAD` requests (25,000 targets per batch); useful for large inputs |
-| **Vectorized scoring** | Candidate scoring done with NumPy array operations instead of row-by-row loops |
+| **Parallel Gaia downloads** | Up to 5 simultaneous `TAP_UPLOAD` requests (25,000 targets per batch) |
+| **Vectorized scoring** | Candidate scoring done with NumPy array operations |
 
-Most of the runtime is spent fitting the Bayesian models, not downloading or scoring, so no overall speedup factor is claimed. Parallel downloads only help when the input needs more than one batch: the extended sample (3,409 components) fits in a single batch, while the full catalog (288,618 components) needs 12.
+Most of the runtime is spent fitting the Bayesian models, not downloading or scoring. Parallel downloads only help when the input needs more than one batch: the extended sample (3,409 components) fits in a single batch, while the full catalog (288,618 components) needs 12.
 
-## 4. Project Status
+## 4. Scientific Background
 
-- **Extended sample (3,409 components):** 1,350 components (39.6%) globally assigned.
-- **Next steps:** run the full catalog (288,618 components).
-
-## 5. Scientific Background
-
-The methodology implemented in this pipeline is based on:
+The methodology implemented in this pipeline is primarily based on:
 
 1. Medan, I., Lépine, S., & Hartman, Z. (2021). Bayesian Cross-matching of High Proper-motion Stars in Gaia DR2 and Photometric Metallicities for ~1.7 million K and M Dwarfs. *The Astronomical Journal*, 161, 234. https://doi.org/10.3847/1538-3881/abe878
 2. Budavári, T., & Basu, A. (2016). Probabilistic Cross-identification in Crowded Fields as an Assignment Problem. *The Astronomical Journal*, 152, 86. https://doi.org/10.3847/0004-6256/152/4/86
+3. El-Badry, K., Rix H-W., Heintz T. (2021). A million binaries from Gaia eDR3: sample selection and validation of Gaia parallax uncertainties. *Monthly Notices of the Royal Astronomical Society*, 506, 2. https://doi.org/10.1093/mnras/stab323
 
-## 6. Documentation Directory
+## 5. Documentation Directory
 
 - [`docs/INSTALLATION.md`](docs/INSTALLATION.md): requirements, installation and troubleshooting
 - [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md): running the pipeline and interpreting the outputs
