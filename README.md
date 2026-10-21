@@ -104,7 +104,7 @@ The methodology implemented in this pipeline is primarily based on:
 
 ## 6. Experiments
 
-During the process of making the poster for the XXI SOCHIAS Annual Meeting, we did several tests to validate our results (and out of curiosity). Some of these *experiments* can be found at the `experiments`. We consider these some of the most interesting/cool plots and statistical results that didn't make it to the poster presentation. If you're interested in our work, we'd suggest to check them out! Some of these results are:
+During the process of making the poster for the XXI SOCHIAS Annual Meeting, we did several tests to validate our results (and out of curiosity). Some of these *experiments* can be found at the [`experiments`](experiments) folder. We consider these some of the most interesting/revealing plots and statistical results that didn't make it to the poster presentation. If you're interested in our work, we'd suggest to check them out! Some of these results are:
 
 - [`experiments/orbit_ensemble.png`](experiments/orbit_ensemble.png): Attempt to fit the orbit of the system WDS 12204+0035, which has a very high *F* factor. It shows potential for an orbit computation, but better priors are needed (such as mass).
 - [`experiments/full_fraction_vs_separation.png`](experiments/full_fraction_vs_separation.png): Comparing the completeness vs angular separation between this, the AstraKairos' crossmatch, and USNO's crossmatch.
