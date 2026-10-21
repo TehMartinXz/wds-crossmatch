@@ -101,3 +101,14 @@ The methodology implemented in this pipeline is primarily based on:
 - [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md): running the pipeline and interpreting the outputs
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): pipeline stages, statistical model and design decisions
 - [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md): functions, parameters and return values
+
+## 6. Experiments
+
+During the process of making the poster for the XXI SOCHIAS Annual Meeting, we did several tests to validate our results (and out of curiosity). Some of these *experiments* can be found at the `experiments`. We consider these some of the most interesting/cool plots and statistical results that didn't make it to the poster presentation. If you're interested in our work, we'd suggest to check them out! Some of these results are:
+
+- [`experiments/orbit_ensemble.png`](experiments/orbit_ensemble.png): Attempt to fit the orbit of the system WDS 12204+0035, which has a very high *F* factor. It shows potential for an orbit computation, but better priors are needed (such as mass).
+- [`experiments/full_fraction_vs_separation.png`](experiments/full_fraction_vs_separation.png): Comparing the completeness vs angular separation between this, the AstraKairos' crossmatch, and USNO's crossmatch.
+- [`experiments/full_difference_new_minus_usno.png`](experiments/full_difference_new_minus_usno.png): The difference in completeness vs angular separation between this catalog and the USNO's crossmatch.
+- [`experiments/hungarian_vs_no_hungarian.png`](experiments/hungarian_vs_no_hungarian.png): The fraction of selections affected by the Hungarian algorithm. This shows that the algorithm does cause greater completeness at lower angular separations.
+- Overall recovery: 254,037/288,618 components matched (88.02%); 120,194/157,689 pairs classified as FULL (76.22%).
+- Only 23 out of 126 characterized hierarchical triples were found in another higher-order binaries catalog (specifically, all 23 of them are in the Multiple Star Catalog, by Andrei Tokovinin). 

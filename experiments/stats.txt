@@ -1,0 +1,16 @@
+#####################
+# Random statistics #
+#####################
+
+- Overall recovery: 254,037/288,618 components matched (88.02%); 120,194/157,689 pairs classified as FULL (76.22%).
+- USNO agreement: 98.35% identical IDs among 226,922 components assigned in both catalogs; 99.57% unordered agreement among 94,502 pairs FULL in both.
+- Historical El-Badry references: 38,198/38,295 selected pairs (99.75%) contain an ElB2021-family reference; two cases remain indeterminate.
+- Physical candidates: 37,916 FULL pairs have El-Badry R < 0.01, including 31,867 MSMS, 645 WDMS, 157 WDWD and 5,247 incompletely classified pairs.
+- Color–magnitude diagram: 70,583 unique Gaia sources plotted after photometric/parallax requirements and exclusion of one color outlier.
+- Historical candidates: after quality and orbital-note filters, F >= 0.1 selects 312, 560 or 1,224 pairs for assumed total masses of 1, 2 or 5 solar masses.
+- Calibration reproducibility: all 459,084 candidate probabilities reproduce the saved model arrays to numerical precision; all 39 calibration models are available.
+- Input audit: ten component-label parsing issues were identified, and 241 original WDS Summary rows lack a WDS ID in the component inventory.
+- Poster sample: 126 systems satisfy El-Badry membership, successful characterization and R<0.01; three of the 129 successfully characterized El-Badry systems fail the last cut.
+- Multiple Star Catalog (MSC, by Andrei Tokovinin) overlap: 23/126 poster systems (18.3%) were identified in the MSC; the remaining 103 require further checks before claiming novelty.
+- Shariat catalog overlap (https://doi.org/10.1088/1538-3873/adfb30): 8/304 pairs (2.63%) match the resolved-triples catalog, all outside the El-Badry subset.
+- Shariat overlap 2: none of the 126 poster systems are present in their catalog; positional checks also found no constituent-source matches within 2″.
