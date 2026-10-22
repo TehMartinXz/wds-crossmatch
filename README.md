@@ -1,4 +1,7 @@
 # wds-crossmatch
+
+**The main catalog files are already available! [Click here](https://drive.google.com/drive/u/0/folders/1MzVAYE3cDP7Cl3b5xQDhxEbyMk5DcDDE).**
+
 Repository for the project: "A Statistical View of the Washington Double Star Catalog using Gaia DR3"
 
 Quick description: This is an attempt to crossmatch every component of the Washington Double Star Catalog (WDS) to a Gaia DR3 source. The base crossmatching work (including the Summary file generation) was originally made for the [AstraKairos project](https://github.com/AstraKairos/astrakairos), which consisted of a simple weight system to assign a crossmatching confidence value based on the distance between a WDS coordinate and a Gaia DR3 source, as well as the magnitude difference between these catalogs. For this work, we opted for a more statistically-sound method by updating the per-component matching logic to include adaptations of the Bayesian crossmatching algorithm presented by [Medan et al.](https://doi.org/10.3847/1538-3881/abe878) as well as the Hungarian algorithm optimization shown by [Budavári & Basu](http://dx.doi.org/10.3847/0004-6256/152/4/86) (B&B's method was used as an attempt to partially solve the multiplicity problem mentioned in Medan's work).
