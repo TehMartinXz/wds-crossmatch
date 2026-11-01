@@ -2,6 +2,8 @@
 
 **The main catalog files are already available! [Click here](https://drive.google.com/drive/u/0/folders/1MzVAYE3cDP7Cl3b5xQDhxEbyMk5DcDDE).**
 
+**[Click here](/Poster_Cross_match_SOCHIAS_2026_GitHub.pdf) to see the poster we presented at the [XXI SOCHIAS Annual Meeting](https://sites.google.com/view/xxisochiasmeeting).**
+
 Repository for the project: "A Statistical View of the Washington Double Star Catalog using Gaia DR3"
 
 Quick description: This is an attempt to crossmatch every component of the Washington Double Star Catalog (WDS) to a Gaia DR3 source. The base crossmatching work (including the Summary file generation) was originally made for the [AstraKairos project](https://github.com/AstraKairos/astrakairos), which consisted of a simple weight system to assign a crossmatching confidence value based on the distance between a WDS coordinate and a Gaia DR3 source, as well as the magnitude difference between these catalogs. For this work, we opted for a more statistically-sound method by updating the per-component matching logic to include adaptations of the Bayesian crossmatching algorithm presented by [Medan et al.](https://doi.org/10.3847/1538-3881/abe878) as well as the Hungarian algorithm optimization shown by [Budavári & Basu](http://dx.doi.org/10.3847/0004-6256/152/4/86) (B&B's method was used as an attempt to partially solve the multiplicity problem mentioned in Medan's work).
@@ -20,9 +22,9 @@ This work was made by the AstroKern student initivative collaboration at Univers
    1.3. [What You Get](#13-what-you-get)
 2. [What It Does](#2-what-it-does)
 3. [Key Features](#3-key-features)
-4. [Project Status](#4-project-status)
-5. [Scientific Background](#5-scientific-background)
-6. [Documentation Directory](#6-documentation-directory)
+4. [Scientific Background](#4-scientific-background)
+5. [Documentation Directory](#5-documentation-directory)
+6. [Experiments](#6-experiments)
 
 ---
 
