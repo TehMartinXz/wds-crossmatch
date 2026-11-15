@@ -14,6 +14,54 @@ The output retains every WDS Summary field parsed by this script and adds:
 - per-component WDS--Gaia proper-motion differences, and
 - absolute WDS/Gaia magnitude contrasts and WDS endpoint changes/rates.
 
+Effective counterparts and completeness
+---------------------------------------
+Each endpoint uses an *effective* Gaia counterpart, recorded in
+source_origin_1/2:
+- assigned:            the globally assigned source of its own record;
+- shared_<reason>:     the source inherited after the global assignment
+                       (crossmatch columns shared_source_id/_reason/
+                       _with_upload_id; reasons tie, same_label);
+- partner:             pair-level rule applied here. An unassigned endpoint
+                       inherits the source of its pair partner when the
+                       partner's source is itself shared and is this
+                       endpoint's own locally preferred candidate.
+Gaia quantities of an inherited endpoint are those of the inherited source;
+posterior_prob, dist_arcsec and bayes_model are the endpoint's own values
+for that source (its best_* values, since the source is its best candidate).
+
+completeness_flag:
+  FULL         two distinct effective sources;
+  SAME_SOURCE  both endpoints have the same effective source (Gaia does not
+               resolve the pair); pair-level Gaia diagnostics are left blank;
+  PARTIAL      one endpoint with a source;
+  NONE         neither.
+completeness_flag_assigned keeps the previous definition, based on globally
+assigned sources only, and assigned_gaia_id_1/2 the assigned identifiers.
+
+Geometric consistency (geom_flag, FULL pairs only)
+--------------------------------------------------
+The Gaia relative position of endpoint 2 about endpoint 1 at J2016.0 is moved
+back to the last WDS epoch with the Gaia relative proper motion and compared
+with (sep_last, pa_last). The tolerance is
+    0.1" + 0.05 sep_last
+    + |dt| (2 dmu_orb + 3 sigma_dmu) + 0.5 yr |dmu|
+with dmu_orb the 5 Msun circular-orbit scale (delta_pm_orbital), sigma_dmu its
+propagated Gaia error and the 0.5-yr term for the integer WDS dates.
+  consistent    residual within tolerance;
+  flipped       consistent only after a 180 deg rotation (A/B labels or
+                quadrant ambiguity), not a misidentification;
+  inconsistent  neither;
+  untestable    missing WDS geometry, sep_last = 999.9, no parallax or
+                proper motions.
+WDS position angles are not precessed; the fractional term absorbs it for
+most epochs. geom_flag is a diagnostic, not a selection.
+
+Other flags: id_uncertain (WDS note I, identification uncertain) and
+wds_mag_nonV (notes B, R or K: magnitudes not V-like). sep_first/sep_last
+equal to 999.9 (>= 1000", overflow of the F5.1 field) are treated as missing
+in delta_sep_abs, delta_sep_rate and the geometric check.
+
 Inputs:
 - WDS Summary file (wdsweb_summ2.txt)
 - Bayesian component-level crossmatch output (components_crossmatch_bayesian.csv)
@@ -38,13 +86,29 @@ warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
 test = False
 
 summary_file = './data/wdsweb_summ2.txt'
-crossmatch_file = './outputs/components_crossmatch_bayesian.csv'
-output_file = './outputs/wds_summary_with_gaia.csv'
+crossmatch_file = './outputs/13-11-2026-crossmatch/components_crossmatch_bayesian.csv'
+output_file = './outputs/13-11-2026-crossmatch/wds_summary_with_gaia.csv'
 if test:
     crossmatch_file = './example_outputs/components_crossmatch_bayesian.csv'
     output_file = './example_outputs/wds_summary_with_gaia.csv'
 # Configuration Paths
 elbadry_file = './data/all_columns_catalog.fits'
+
+# Gaia DR3 reference epoch (Julian year).
+GAIA_REF_EPOCH = 2016.0
+# WDS Summary separations are F5.1; 999.9 marks separations >= 1000".
+WDS_SEP_SENTINEL = 999.9
+
+# Geometric consistency tolerance (see module docstring).
+GEOM_TOL_FLOOR_ARCSEC = 0.1
+GEOM_TOL_FRACTION = 0.05
+GEOM_ORBIT_FACTOR = 2.0
+GEOM_PM_NSIGMA = 3.0
+GEOM_DATE_HALF_RANGE_YR = 0.5
+
+# WDS Summary note codes.
+ID_UNCERTAIN_NOTE = 'I'
+NON_V_MAG_NOTE_CODES = ('B', 'R', 'K')
 
 
 def parse_summary_line(line):
@@ -113,6 +177,7 @@ def build_crossmatch_lookup(crossmatch_df):
     """Build component lookups while preserving repeated component labels."""
     lookup = {}
     wds_ids = set()
+    by_upload = {}
 
     for row in crossmatch_df.to_dict(orient='records'):
         wds_id = str(row.get('wds_id', '')).strip()
@@ -124,7 +189,11 @@ def build_crossmatch_lookup(crossmatch_df):
         if disc:
             lookup.setdefault((wds_id, disc, comp), []).append(row)
 
-    return lookup, wds_ids
+        upload_id = str(row.get('upload_id', '')).strip()
+        if upload_id:
+            by_upload[upload_id] = row
+
+    return lookup, wds_ids, by_upload
 
 
 def _component_candidates(wds_id, discoverer, comp_letter, lookup):
@@ -245,10 +314,11 @@ def _to_float(comp_data, *keys):
 
 def _gaia_val(comp_data, base_key):
     """
-    Read a Gaia value from the globally assigned counterpart.
+    Read a Gaia value from the effective counterpart of an endpoint.
 
-    Pair-level physical diagnostics must use only ``assigned_*`` values so that
-    an unassigned ``best_*`` candidate cannot leak into the published summary.
+    Pair-level physical diagnostics use only ``assigned_*`` values, which for
+    an inherited endpoint hold the inherited source (see effective_component).
+    An unassigned ``best_*`` candidate therefore never leaks into the summary.
     """
     if not comp_data:
         return None
@@ -273,13 +343,100 @@ def _best_val(comp_data, base_key):
 
 
 def _has_gaia_match(comp_data):
-    """True only for a globally assigned Gaia counterpart."""
+    """True for an endpoint with an effective Gaia counterpart.
+
+    Raw crossmatch rows count only when globally assigned. Rows prepared by
+    effective_component also count when they inherited a source.
+    """
     if not comp_data:
         return False
 
     source_id = _get_val(comp_data, 'assigned_source_id')
+    if '_effective_origin' in comp_data:
+        return bool(comp_data['_effective_origin']) and source_id is not None
     status = _norm_str(_get_val(comp_data, 'assignment_status'))
     return status == 'assigned_global' and source_id is not None
+
+
+def _effective_origin(comp_data):
+    if not comp_data:
+        return ''
+    return comp_data.get('_effective_origin', '')
+
+
+# The inherited source is the endpoint's own best candidate, so its own
+# association values for that source are the best_* values.
+_OWN_BEST_OVERLAY = {
+    'assigned_posterior_prob': 'best_posterior_prob',
+    'assigned_dist_arcsec': 'best_dist_arcsec',
+    'assigned_bayes_model': 'best_bayes_model',
+    'assigned_quasi_color': 'best_quasi_color',
+}
+
+
+def _inherit_from(row, donor, origin):
+    """Copy of `row` whose assigned_* Gaia values come from `donor`."""
+    eff = dict(row)
+    for key, value in donor.items():
+        if key.startswith('assigned_'):
+            eff[key] = value
+    for target, source in _OWN_BEST_OVERLAY.items():
+        eff[target] = row.get(source, '')
+    eff['_effective_origin'] = origin
+    return eff
+
+
+def effective_component(row, by_upload):
+    """Return the endpoint row with its effective Gaia counterpart.
+
+    assigned  -> own globally assigned source;
+    shared_*  -> source inherited in the crossmatch (shared_source_id), whose
+                 Gaia values are read from the winning record.
+    Otherwise the row is returned with origin ''.
+    """
+    if not row:
+        return {}
+    if (_norm_str(_get_val(row, 'assignment_status')) == 'assigned_global'
+            and _get_val(row, 'assigned_source_id') is not None):
+        eff = dict(row)
+        eff['_effective_origin'] = 'assigned'
+        return eff
+
+    reason = _norm_str(_get_val(row, 'shared_source_reason'))
+    donor_id = _norm_str(_get_val(row, 'shared_with_upload_id'))
+    shared_id = _norm_str(_get_val(row, 'shared_source_id'))
+    donor = by_upload.get(donor_id) if donor_id else None
+    if (reason and donor is not None and shared_id
+            and _norm_str(_get_val(donor, 'assigned_source_id')) == shared_id):
+        return _inherit_from(row, donor, f'shared_{reason}')
+
+    eff = dict(row)
+    eff['_effective_origin'] = ''
+    return eff
+
+
+def apply_partner_rule(eff1, eff2):
+    """Pair-level extension of the shared-source rule.
+
+    An unassigned endpoint without an effective source inherits its partner's
+    source when that source was itself inherited (shared_*) and is this
+    endpoint's own locally preferred candidate. Typical case: A wins the
+    blend, Aa inherits it by a tie, Ab points to the same source without a
+    tie; the pair Aa,Ab then becomes SAME_SOURCE.
+    """
+    def try_inherit(target, partner):
+        if not target or _effective_origin(target):
+            return target
+        if not _effective_origin(partner).startswith('shared_'):
+            return target
+        if _norm_str(_get_val(target, 'assignment_status')) != 'not_assigned_global':
+            return target
+        best = _norm_str(_get_val(target, 'best_source_id'))
+        if best and best == _norm_str(_get_val(partner, 'assigned_source_id')):
+            return _inherit_from(target, partner, 'partner')
+        return target
+
+    return try_inherit(eff1, eff2), try_inherit(eff2, eff1)
 
 
 def _assignment_status(comp_data):
@@ -342,7 +499,15 @@ def _finite_number(value):
     return number if math.isfinite(number) else None
 
 
-def _pair_change_metrics(summary_data, c1, c2):
+def _wds_separation(value):
+    """WDS separation in arcsec, or None if absent, negative or 999.9."""
+    sep = _finite_number(value)
+    if sep is None or sep < 0.0 or math.isclose(sep, WDS_SEP_SENTINEL):
+        return None
+    return sep
+
+
+def _pair_change_metrics(summary_data, c1, c2, pair_resolved=True):
     """Magnitude contrasts and endpoint changes; unavailable results stay blank.
 
     WDS magnitudes come from the pair's original Summary row. Gaia magnitudes
@@ -366,7 +531,7 @@ def _pair_change_metrics(summary_data, c1, c2):
     result['delta_mag_wds'] = abs_difference(
         summary_data.get('mag_pri'), summary_data.get('mag_sec')
     )
-    if _has_gaia_match(c1) and _has_gaia_match(c2):
+    if pair_resolved and _has_gaia_match(c1) and _has_gaia_match(c2):
         result['delta_mag_gaia'] = abs_difference(
             _gaia_val(c1, 'phot_g_mean_mag'),
             _gaia_val(c2, 'phot_g_mean_mag'),
@@ -378,10 +543,9 @@ def _pair_change_metrics(summary_data, c1, c2):
             and 0.0 <= pa_first <= 360.0 and 0.0 <= pa_last <= 360.0):
         result['delta_pa_abs'] = abs((pa_last - pa_first + 180.0) % 360.0 - 180.0)
 
-    sep_first = _finite_number(summary_data.get('sep_first'))
-    sep_last = _finite_number(summary_data.get('sep_last'))
-    if (sep_first is not None and sep_last is not None
-            and sep_first >= 0.0 and sep_last >= 0.0):
+    sep_first = _wds_separation(summary_data.get('sep_first'))
+    sep_last = _wds_separation(summary_data.get('sep_last'))
+    if sep_first is not None and sep_last is not None:
         result['delta_sep_abs'] = abs_difference(sep_first, sep_last)
 
     num_obs = _finite_number(summary_data.get('num_obs'))
@@ -399,6 +563,66 @@ def _pair_change_metrics(summary_data, c1, c2):
                     if math.isfinite(rate):
                         result[f'delta_{quantity}_rate'] = rate
     return result
+
+
+def _geometric_consistency(summary_data, gaia_sep, gaia_pa, pm1, pm2,
+                           e_delta_pm, delta_pm_orbital, pair_resolved):
+    """Compare the Gaia relative position, moved back to the last WDS epoch,
+    with the last WDS measurement. See the module docstring."""
+    out = {
+        'geom_flag': '', 'geom_resid_arcsec': '', 'geom_resid_flip_arcsec': '',
+        'geom_tol_arcsec': '', 'geom_dt_yr': '',
+    }
+    if not pair_resolved:
+        return out
+
+    rho_w = _wds_separation(summary_data.get('sep_last'))
+    pa_w = _finite_number(summary_data.get('pa_last'))
+    t_last = _finite_number(summary_data.get('date_last'))
+    numbers = (rho_w, pa_w, t_last, *pm1, *pm2)
+    if (any(v is None for v in numbers) or gaia_sep == '' or gaia_pa == ''
+            or delta_pm_orbital == ''):
+        out['geom_flag'] = 'untestable'
+        return out
+
+    dt = GAIA_REF_EPOCH - t_last
+    dmu_e = pm2[0] - pm1[0]
+    dmu_n = pm2[1] - pm1[1]
+    th_g = math.radians(gaia_pa)
+    th_w = math.radians(pa_w)
+
+    # Relative position (east, north) in arcsec.
+    pred_e = gaia_sep * math.sin(th_g) - dmu_e * dt / 1000.0
+    pred_n = gaia_sep * math.cos(th_g) - dmu_n * dt / 1000.0
+    wds_e = rho_w * math.sin(th_w)
+    wds_n = rho_w * math.cos(th_w)
+
+    resid = math.hypot(pred_e - wds_e, pred_n - wds_n)
+    resid_flip = math.hypot(pred_e + wds_e, pred_n + wds_n)
+
+    sigma_dmu = e_delta_pm if isinstance(e_delta_pm, float) else 0.0
+    tol = (
+        GEOM_TOL_FLOOR_ARCSEC
+        + GEOM_TOL_FRACTION * rho_w
+        + (abs(dt) * (GEOM_ORBIT_FACTOR * delta_pm_orbital + GEOM_PM_NSIGMA * sigma_dmu)
+           + GEOM_DATE_HALF_RANGE_YR * math.hypot(dmu_e, dmu_n)) / 1000.0
+    )
+
+    if resid <= tol:
+        flag = 'consistent'
+    elif resid_flip <= tol:
+        flag = 'flipped'
+    else:
+        flag = 'inconsistent'
+
+    out.update({
+        'geom_flag': flag,
+        'geom_resid_arcsec': resid,
+        'geom_resid_flip_arcsec': resid_flip,
+        'geom_tol_arcsec': tol,
+        'geom_dt_yr': dt,
+    })
+    return out
 
 
 def generate_summary_with_gaia(summary_path, crossmatch_path, output_path, elbadry_path=None):
@@ -419,7 +643,10 @@ def generate_summary_with_gaia(summary_path, crossmatch_path, output_path, elbad
             + ", ".join(missing_columns)
         )
 
-    crossmatch_lookup, available_wds_ids = build_crossmatch_lookup(crossmatch_df)
+    crossmatch_lookup, available_wds_ids, by_upload = build_crossmatch_lookup(crossmatch_df)
+    if 'shared_source_reason' not in crossmatch_df.columns:
+        print("  - Warning: crossmatch has no shared-source columns; "
+              "only globally assigned counterparts are used.")
     print(f"  - {len(available_wds_ids)} unique WDS systems in crossmatch")
     
     elbadry_pairs = {}
@@ -458,10 +685,18 @@ def generate_summary_with_gaia(summary_path, crossmatch_path, output_path, elbad
         pairs_processed += 1
         comp1, comp2 = extract_component_letters(summary_data['components'])
             
-        c1, c2 = find_pair_components(
+        r1, r2 = find_pair_components(
             wds_id, summary_data['discoverer'], comp1, comp2, crossmatch_lookup
         )
-        
+
+        # Effective counterparts: assigned, inherited in the crossmatch, or
+        # inherited from the pair partner.
+        c1 = effective_component(r1, by_upload)
+        c2 = effective_component(r2, by_upload)
+        c1, c2 = apply_partner_rule(c1, c2)
+        source_origin_1 = _effective_origin(c1)
+        source_origin_2 = _effective_origin(c2)
+
         has_match_1 = _has_gaia_match(c1)
         has_match_2 = _has_gaia_match(c2)
 
@@ -469,11 +704,26 @@ def generate_summary_with_gaia(summary_path, crossmatch_path, output_path, elbad
         gaia_id_2 = _norm_str(_gaia_val(c2, 'source_id'))
 
         if has_match_1 and has_match_2:
-            completeness_flag = 'FULL'
+            completeness_flag = 'SAME_SOURCE' if gaia_id_1 == gaia_id_2 else 'FULL'
         elif has_match_1 or has_match_2:
             completeness_flag = 'PARTIAL'
         else:
             completeness_flag = 'NONE'
+        pair_resolved = completeness_flag == 'FULL'
+
+        # Previous definition, based on globally assigned sources only.
+        assigned_gaia_id_1 = gaia_id_1 if source_origin_1 == 'assigned' else ''
+        assigned_gaia_id_2 = gaia_id_2 if source_origin_2 == 'assigned' else ''
+        if assigned_gaia_id_1 and assigned_gaia_id_2:
+            completeness_flag_assigned = 'FULL'
+        elif assigned_gaia_id_1 or assigned_gaia_id_2:
+            completeness_flag_assigned = 'PARTIAL'
+        else:
+            completeness_flag_assigned = 'NONE'
+
+        notes_str = summary_data.get('notes', '') or ''
+        id_uncertain = ID_UNCERTAIN_NOTE in notes_str
+        wds_mag_nonV = any(code in notes_str for code in NON_V_MAG_NOTE_CODES)
 
         assignment_status_1 = _assignment_status(c1)
         assignment_status_2 = _assignment_status(c2)
@@ -488,10 +738,12 @@ def generate_summary_with_gaia(summary_path, crossmatch_path, output_path, elbad
         best_model_2 = _norm_str(_best_val(c2, 'bayes_model'))
 
         best_equals_assigned_1 = (
-            best_gaia_id_1 == gaia_id_1 if best_gaia_id_1 and gaia_id_1 else ''
+            best_gaia_id_1 == assigned_gaia_id_1
+            if best_gaia_id_1 and assigned_gaia_id_1 else ''
         )
         best_equals_assigned_2 = (
-            best_gaia_id_2 == gaia_id_2 if best_gaia_id_2 and gaia_id_2 else ''
+            best_gaia_id_2 == assigned_gaia_id_2
+            if best_gaia_id_2 and assigned_gaia_id_2 else ''
         )
 
         # Robust Gaia Coordinate Resolution (Checks Gaia coordinates first, avoids raw WDS string strings)
@@ -502,7 +754,7 @@ def generate_summary_with_gaia(summary_path, crossmatch_path, output_path, elbad
 
         gaia_sep_arcsec = ''
         gaia_pa_deg = ''
-        if None not in (ra1, dec1, ra2, dec2):
+        if pair_resolved and None not in (ra1, dec1, ra2, dec2):
             sc1 = SkyCoord(ra=ra1 * u.deg, dec=dec1 * u.deg, frame='icrs')
             sc2 = SkyCoord(ra=ra2 * u.deg, dec=dec2 * u.deg, frame='icrs')
             gaia_sep_arcsec = float(sc1.separation(sc2).arcsec)
@@ -528,7 +780,7 @@ def generate_summary_with_gaia(summary_path, crossmatch_path, output_path, elbad
         erv2 = _gaia_float(c2, 'radial_velocity_error')
 
         delta_rv, e_delta_rv, sigma_delta_rv = '', '', ''
-        if rv1 is not None and rv2 is not None:
+        if pair_resolved and rv1 is not None and rv2 is not None:
             delta_rv = abs(float(rv2 - rv1))
             if erv1 is not None and erv2 is not None:
                 e = float((erv1 ** 2 + erv2 ** 2) ** 0.5)
@@ -547,7 +799,7 @@ def generate_summary_with_gaia(summary_path, crossmatch_path, output_path, elbad
             inflation_2 = 1.0 + (f_max_2 - 1.0) * (1.0 - math.exp(-2.77 * (ruwe2 - 1.0)))
 
         delta_parallax, e_delta_parallax, sigma_delta_parallax = '', '', ''
-        if plx1 is not None and plx2 is not None:
+        if pair_resolved and plx1 is not None and plx2 is not None:
             delta_parallax = abs(float(plx1 - plx2))
             if eplx1 is not None and eplx2 is not None:
                 e_plx = float(((eplx1 * inflation_1) ** 2 + (eplx2 * inflation_2) ** 2) ** 0.5)
@@ -592,7 +844,7 @@ def generate_summary_with_gaia(summary_path, crossmatch_path, output_path, elbad
             )
 
         delta_pm, delta_pm_orbital, e_delta_pm, delta_pm_norm = '', '', '', ''
-        if None not in (pmra1, pmra2, pmdec1, pmdec2):
+        if pair_resolved and None not in (pmra1, pmra2, pmdec1, pmdec2):
             dmu_ra, dmu_dec = float(pmra1 - pmra2), float(pmdec1 - pmdec2)
             delta_pm = float((dmu_ra ** 2 + dmu_dec ** 2) ** 0.5)
             
@@ -618,8 +870,9 @@ def generate_summary_with_gaia(summary_path, crossmatch_path, output_path, elbad
         col1 = None not in (bp_rp1, G1, plx1) and plx1 > 0
         col2 = None not in (bp_rp2, G2, plx2) and plx2 > 0
         
-        binary_type = '????' 
-        if col1 or col2:
+        # Not applicable when both endpoints are the same Gaia source.
+        binary_type = '' if completeness_flag == 'SAME_SOURCE' else '????'
+        if completeness_flag != 'SAME_SOURCE' and (col1 or col2):
             Mg1 = G1 + 5.0 * math.log10(plx1 / 100.0) if col1 else None
             Mg2 = G2 + 5.0 * math.log10(plx2 / 100.0) if col2 else None
             
@@ -636,13 +889,21 @@ def generate_summary_with_gaia(summary_path, crossmatch_path, output_path, elbad
                 binary_type = 'WD??' if wd2 else 'MS??'
 
         # Fetch El-Badry Cross-reference
-        in_elbadry, r_chance_align = get_elbadry_info(gaia_id_1, gaia_id_2, elbadry_pairs)
+        if pair_resolved:
+            in_elbadry, r_chance_align = get_elbadry_info(gaia_id_1, gaia_id_2, elbadry_pairs)
+        else:
+            in_elbadry, r_chance_align = False, ''
 
         # Start from the complete parsed WDS Summary row, then append derived and
         # Gaia quantities. This guarantees that every WDS Summary-file column
         # parsed above is retained in the output catalog.
         result = dict(summary_data)
-        result.update(_pair_change_metrics(summary_data, c1, c2))
+        result.update(_pair_change_metrics(summary_data, c1, c2, pair_resolved))
+        result.update(_geometric_consistency(
+            summary_data, gaia_sep_arcsec, gaia_pa_deg,
+            (pmra1, pmdec1), (pmra2, pmdec2),
+            e_delta_pm, delta_pm_orbital, pair_resolved,
+        ))
         result.update({
             'wds_id': summary_data['wds_id'],
             'discoverer': summary_data['discoverer'],
@@ -661,6 +922,13 @@ def generate_summary_with_gaia(summary_path, crossmatch_path, output_path, elbad
             'dm_number': summary_data['dm_number'],
             'notes': summary_data['notes'],
             'completeness_flag': completeness_flag,
+            'completeness_flag_assigned': completeness_flag_assigned,
+            'source_origin_1': source_origin_1,
+            'source_origin_2': source_origin_2,
+            'assigned_gaia_id_1': assigned_gaia_id_1,
+            'assigned_gaia_id_2': assigned_gaia_id_2,
+            'id_uncertain': id_uncertain,
+            'wds_mag_nonV': wds_mag_nonV,
             'assignment_status_1': assignment_status_1,
             'assignment_status_2': assignment_status_2,
             'best_gaia_id_1': best_gaia_id_1,
@@ -763,9 +1031,24 @@ def generate_summary_with_gaia(summary_path, crossmatch_path, output_path, elbad
     
     print(f"\nSummary:")
     print(f"  - Pairs processed from summary: {pairs_processed}")
-    print(f"  - FULL (both components matched): {sum(1 for r in results if r['completeness_flag'] == 'FULL')}")
-    print(f"  - PARTIAL (one component matched): {sum(1 for r in results if r['completeness_flag'] == 'PARTIAL')}")
-    print(f"  - NONE: {sum(1 for r in results if r['completeness_flag'] == 'NONE')}")
+    def count(key, value):
+        return sum(1 for r in results if r[key] == value)
+
+    print("  completeness_flag (effective)      [assigned only]")
+    for flag in ('FULL', 'SAME_SOURCE', 'PARTIAL', 'NONE'):
+        print(f"  - {flag:12s} {count('completeness_flag', flag):8d}"
+              f"            [{count('completeness_flag_assigned', flag)}]")
+    origins = {}
+    for r in results:
+        for k in (1, 2):
+            o = r[f'source_origin_{k}'] or '(none)'
+            origins[o] = origins.get(o, 0) + 1
+    print("  Endpoint source origins:")
+    for o, n in sorted(origins.items(), key=lambda x: -x[1]):
+        print(f"  - {o:22s} {n}")
+    print("  geom_flag (FULL pairs):")
+    for flag in ('consistent', 'flipped', 'inconsistent', 'untestable'):
+        print(f"  - {flag:12s} {count('geom_flag', flag)}")
     
     result_df = pd.DataFrame(results)
     
@@ -776,7 +1059,10 @@ def generate_summary_with_gaia(summary_path, crossmatch_path, output_path, elbad
         'assignment_status_1', 'assignment_status_2',
         'gaia_id_1', 'gaia_id_2', 'best_gaia_id_1', 'best_gaia_id_2',
         'best_bayes_model_1', 'best_bayes_model_2', 'bayes_model_1', 'bayes_model_2',
-        'wds_ra_1', 'wds_dec_1', 'wds_ra_2', 'wds_dec_2', 'in_elbadry_2021'
+        'wds_ra_1', 'wds_dec_1', 'wds_ra_2', 'wds_dec_2', 'in_elbadry_2021',
+        'completeness_flag_assigned', 'source_origin_1', 'source_origin_2',
+        'assigned_gaia_id_1', 'assigned_gaia_id_2', 'id_uncertain', 'wds_mag_nonV',
+        'geom_flag'
     ]
     
     for col in result_df.columns:

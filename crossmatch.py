@@ -39,6 +39,12 @@ Methodological details
   H1 subtraction, empirical priors, and Bayes grid are then constructed.
 - Percentile smoothing is scipy.ndimage.percentile_filter(..., percentile=60,
   size=5), matching the supplied Medan implementation.
+- WDS records whose notes contain B, R or K give summary-line magnitudes in
+  a blue, red/I or infrared band rather than a V-like band. Their m_WDS is
+  not used: they are excluded from the training samples of every
+  magnitude-conditioned model and are scored with the |b|-only angular model
+  (bayes_model = 1D_b_nonV_WDS_mag). The original magnitude is retained in
+  the output, together with the boolean wds_mag_nonV.
 - If WDS magnitude is known but Gaia G is missing, a separately calibrated
   theta-only model is used for the same (m_WDS, |b|) stratum. These theta-only
   models are trained on all RAW/DISPLACED candidates in the stratum, regardless
@@ -57,6 +63,18 @@ Methodological details
 - The reported pairwise posterior is an empirical association probability under
   H1 versus random-field H0. It is not a marginal posterior over all possible
   global catalog assignments.
+- Shared sources. After the assignment, an unassigned record inherits the
+  Gaia source assigned to another record of its own assignment group when
+  that source is its locally preferred candidate and either
+    (tie)        its posterior for that source equals the winner's within
+                 1e-12, so the solver's choice between them was arbitrary, or
+    (same_label) it has the same WDS identifier and component label as the
+                 winner, i.e. the same component is listed twice.
+  The inherited source is reported in shared_source_id; assigned_source_id is
+  left unchanged as the result of the one-to-one optimization.
+  effective_source_id is the assigned source or, failing that, the shared
+  one. The pair-level partner rule needs reconstructed pairs and is applied
+  by the summary generator.
 
 Gaia retrieval
 --------------
@@ -70,7 +88,9 @@ The 15-arcsec model queries retrieve only source_id, position and Gaia G; the
 Outputs
 -------
 - One final row per WDS component, containing both the globally assigned Gaia
-  source (if any) and the highest-posterior individual eligible candidate.
+  source (if any) and the highest-posterior individual eligible candidate,
+  plus shared_source_id, shared_source_reason, shared_with_upload_id and
+  effective_source_id.
 - A scored-candidate table containing every final candidate edge within 5 arcsec.
 - Scalar model diagnostics and compressed model arrays for reproducibility.
 - Per-start Gaussian fit-audit CSV at <model-summary>.fit_audit.csv.
@@ -145,16 +165,16 @@ ARI_TAP_URL = "https://gaia.ari.uni-heidelberg.de/tap"
 # Multithreading and TAP Limits Optimized
 ARI_BATCH_SIZE = 25000
 ESA_BATCH_SIZE = 25000
-MAX_TAP_THREADS = 5
+MAX_TAP_THREADS = 5 # You can try increasing this number, but if you start getting "[Errno 11001] getaddrinfo failed" errors, consider reducing it.
 
 # Enable testing mode
 test = False
 
 DEFAULT_COMPONENTS_FILE = "./data/wds_components.summ.txt"
-DEFAULT_OUTPUT_FILE = "./outputs/components_crossmatch_bayesian.csv"
-DEFAULT_CANDIDATE_OUTPUT_FILE = "./outputs/components_crossmatch_candidates_scored.csv"
-DEFAULT_MODEL_SUMMARY_FILE = "./outputs/components_crossmatch_model_summary.csv"
-DEFAULT_MODEL_ARRAYS_FILE = "./outputs/components_crossmatch_model_arrays.npz"
+DEFAULT_OUTPUT_FILE = "./outputs/13-11-2026-crossmatch/components_crossmatch_bayesian.csv"
+DEFAULT_CANDIDATE_OUTPUT_FILE = "./outputs/13-11-2026-crossmatch/components_crossmatch_candidates_scored.csv"
+DEFAULT_MODEL_SUMMARY_FILE = "./outputs/13-11-2026-crossmatch/components_crossmatch_model_summary.csv"
+DEFAULT_MODEL_ARRAYS_FILE = "./outputs/13-11-2026-crossmatch/components_crossmatch_model_arrays.npz"
 
 if test:
     DEFAULT_COMPONENTS_FILE = "./example_data/wds_components.summ.extended.txt"
@@ -165,6 +185,16 @@ if test:
 
 gaia_epoch = 2016.0
 wds_epoch = 2000.0
+
+# WDS summary note codes indicating that the listed magnitudes are not V-like:
+# B = blue (Johnson U or B, blue photographic), R = red (Johnson R or I, red
+# photographic), K = K-band or other infrared (> 1 micron). Note "I" is NOT a
+# band: it flags an uncertain identification and is not used here.
+NON_V_MAG_NOTE_CODES = ("B", "R", "K")
+
+# Posterior tolerance defining an exact tie with the winning record when
+# resolving shared sources after the global assignment.
+SHARED_SOURCE_PROB_TIE = 1e-12
 
 # Medan's released code stores all candidate associations out to 15 arcsec for
 # constructing the empirical distributions, while a 5-arcsec condition is used
@@ -339,6 +369,42 @@ def parse_wds_components(components_file):
     df = df.drop(columns=["raw"])
 
     return df
+
+
+def flag_non_v_magnitudes(wds_df):
+    """Flag records whose WDS magnitudes are given in a non-V-like band."""
+    pattern = "[" + "".join(NON_V_MAG_NOTE_CODES) + "]"
+    wds_df["wds_mag_nonV"] = (
+        wds_df["notes"].fillna("").astype(str)
+        .str.contains(pattern, regex=True)
+        .to_numpy(bool)
+    )
+    return wds_df
+
+
+def attach_non_v_flag(table, wds_df):
+    """Copy wds_mag_nonV onto a Gaia query table through upload_id.
+
+    Applied after retrieval (and after reading the on-disk cache), so the
+    TAP queries and their cache files are unchanged.
+    """
+    flags = pd.Series(
+        wds_df["wds_mag_nonV"].to_numpy(bool),
+        index=wds_df["upload_id"].to_numpy(np.int64),
+    )
+    upload_ids = np.asarray(table["upload_id"], dtype=np.int64)
+    table["wds_mag_nonV"] = flags.reindex(upload_ids).fillna(False).to_numpy(bool)
+    return table
+
+
+def _non_v_mask(df):
+    """Boolean array: True where the WDS magnitude is not V-like."""
+    if "wds_mag_nonV" not in df.columns:
+        return np.zeros(len(df), dtype=bool)
+    return (
+        pd.Series(df["wds_mag_nonV"]).astype("boolean").fillna(False)
+        .to_numpy(dtype=bool)
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -769,7 +835,8 @@ def _finite_quasicolors(table):
     valid = (
         np.isfinite(wds_mag) &
         (wds_mag != 1234.0) &
-        np.isfinite(gaia_g)
+        np.isfinite(gaia_g) &
+        ~_non_v_mask(df)
     )
 
     return gaia_g[valid] - wds_mag[valid]
@@ -1582,6 +1649,11 @@ def build_empirical_bayesian_models(raw_table, disp_table):
 
     raw_wds_mag = pd.to_numeric(raw_df["wds_mag"], errors="coerce").to_numpy(float)
     disp_wds_mag = pd.to_numeric(disp_df["wds_mag"], errors="coerce").to_numpy(float)
+
+    # Non-V-like WDS magnitudes (notes B, R, K) are treated as missing: they
+    # would place the target in the wrong magnitude stratum and shift q.
+    raw_wds_mag = np.where(_non_v_mask(raw_df), np.nan, raw_wds_mag)
+    disp_wds_mag = np.where(_non_v_mask(disp_df), np.nan, disp_wds_mag)
     raw_g = pd.to_numeric(raw_df["phot_g_mean_mag"], errors="coerce").to_numpy(float)
     disp_g = pd.to_numeric(disp_df["phot_g_mean_mag"], errors="coerce").to_numpy(float)
     raw_b = np.abs(pd.to_numeric(raw_df["gal_b"], errors="coerce").to_numpy(float))
@@ -1732,6 +1804,11 @@ def score_candidates(raw_table, model_bundle):
     g_mag = pd.to_numeric(raw_df.get("phot_g_mean_mag", np.nan), errors="coerce").to_numpy(float)
     b_abs = np.abs(pd.to_numeric(raw_df.get("gal_b", np.nan), errors="coerce").to_numpy(float))
 
+    # Non-V-like WDS magnitudes are not used for modeling; these targets are
+    # scored with the |b|-only angular model.
+    non_v = _non_v_mask(raw_df)
+    wds_mag = np.where(non_v, np.nan, wds_mag)
+
     has_wds_mag = np.isfinite(wds_mag) & (wds_mag != 1234.0)
     has_gaia_g = np.isfinite(g_mag)
 
@@ -1762,10 +1839,10 @@ def score_candidates(raw_table, model_bundle):
                     raw_df.loc[update_mask, "model_prior_H1"] = model_1d["prior_H1"]
                     raw_df.loc[update_mask, "model_prior_H0"] = model_1d["prior_H0"]
                     raw_df.loc[update_mask, "scale_S"] = model_1d["scale_S"]
-                    raw_df.loc[update_mask, "bayes_model"] = np.where(
-                        has_gaia_g[update_mask], 
-                        "1D_b_missing_WDS_mag", 
-                        "1D_b_missing_WDS_and_G"
+                    raw_df.loc[update_mask, "bayes_model"] = np.select(
+                        [non_v[update_mask], has_gaia_g[update_mask]],
+                        ["1D_b_nonV_WDS_mag", "1D_b_missing_WDS_mag"],
+                        default="1D_b_missing_WDS_and_G",
                     )
 
         # 2. Iterate over WDS magnitude strata
@@ -2092,7 +2169,8 @@ def optimize_global_assignments(scored_df, wds_df):
         "mag_secondary", "spectral_type", "pmra_primary", "pmdec_primary",
         "pmra_secondary", "pmdec_secondary", "notes", "ra_hh", "ra_mm",
         "ra_ss", "ra", "dec_sign", "dec_deg", "dec_mm", "dec_ss", "dec",
-        "component_type", "upload_id", "ra_j2016", "dec_j2016", "wds_mag", "gal_b"
+        "component_type", "upload_id", "ra_j2016", "dec_j2016", "wds_mag",
+        "wds_mag_nonV", "gal_b"
     ]
 
     final_df = wds_df[wds_cols_ordered].copy()
@@ -2101,7 +2179,8 @@ def optimize_global_assignments(scored_df, wds_df):
     final_df["best_source_id"] = final_df["best_source_id"].astype("Int64")
 
     wds_side_candidate_columns = {
-        "upload_id", "wds_id", "component", "wds_mag", "gal_b", "row_id"
+        "upload_id", "wds_id", "component", "wds_mag", "wds_mag_nonV",
+        "gal_b", "row_id"
     }
     gaia_columns = [
         col for col in scored_df.columns
@@ -2163,6 +2242,101 @@ def optimize_global_assignments(scored_df, wds_df):
     final_df["assigned_edge_margin"] = final_df["upload_id"].map(edge_margin_by_w)
     print(f"Final catalog assembly finished in {time.time() - t0:.1f} s total.")
     return final_df
+
+
+# -----------------------------------------------------------------------------
+# Shared sources after the global assignment
+# -----------------------------------------------------------------------------
+def resolve_shared_sources(final_df):
+    """
+    Let unassigned records inherit a Gaia source assigned to another record.
+
+    An unassigned record (not_assigned_global) inherits the source S assigned
+    to a "winner" record of the same assignment group when S is its own
+    locally preferred candidate and either
+        tie:        |p(record, S) - p(winner, S)| <= SHARED_SOURCE_PROB_TIE,
+                    so the one-to-one solution chose between equal utilities;
+        same_label: the two records share wds_id and component label, i.e.
+                    the WDS component file lists the same component twice.
+
+    No separation or magnitude threshold is involved. assigned_source_id and
+    assignment_status are left unchanged; the new columns are
+        shared_source_id, shared_source_reason, shared_with_upload_id,
+        effective_source_id.
+    The pair-level partner extension requires reconstructed WDS pairs and is
+    applied by the summary generator.
+    """
+    df = final_df.copy()
+    status = df["assignment_status"].astype(str)
+
+    winners = df.loc[
+        status == "assigned_global",
+        ["upload_id", "assignment_group_id", "assigned_source_id",
+         "assigned_posterior_prob", "wds_id", "component"],
+    ].rename(columns={
+        "upload_id": "shared_with_upload_id",
+        "assigned_source_id": "shared_source_id",
+        "assigned_posterior_prob": "winner_posterior_prob",
+        "wds_id": "winner_wds_id",
+        "component": "winner_component",
+    })
+
+    orphans = df.loc[
+        (status == "not_assigned_global")
+        & df["best_source_id"].notna()
+        & df["assignment_group_id"].notna(),
+        ["upload_id", "assignment_group_id", "best_source_id",
+         "best_posterior_prob", "wds_id", "component"],
+    ]
+
+    m = orphans.merge(
+        winners,
+        left_on=["assignment_group_id", "best_source_id"],
+        right_on=["assignment_group_id", "shared_source_id"],
+        how="inner",
+    )
+
+    tie = (
+        (m["best_posterior_prob"] - m["winner_posterior_prob"]).abs()
+        <= SHARED_SOURCE_PROB_TIE
+    ).to_numpy(bool)
+    same_label = (
+        (m["wds_id"].astype(str) == m["winner_wds_id"].astype(str))
+        & (m["component"].astype(str) == m["winner_component"].astype(str))
+    ).to_numpy(bool)
+    reason = np.select(
+        [tie & same_label, tie, same_label],
+        ["tie+same_label", "tie", "same_label"],
+        default="",
+    )
+    m = m.assign(shared_source_reason=reason)
+    m = m[m["shared_source_reason"] != ""]
+
+    if m["upload_id"].duplicated().any():
+        raise RuntimeError("A record matched more than one shared-source winner.")
+
+    m = m[["upload_id", "shared_source_id", "shared_source_reason",
+           "shared_with_upload_id"]].copy()
+    m["shared_source_id"] = m["shared_source_id"].astype("Int64")
+    m["shared_with_upload_id"] = m["shared_with_upload_id"].astype("Int64")
+
+    # Merge, not map: keeps the 19-digit identifiers as exact nullable Int64.
+    df = df.merge(m, on="upload_id", how="left", sort=False)
+    df["shared_source_id"] = df["shared_source_id"].astype("Int64")
+    df["shared_with_upload_id"] = df["shared_with_upload_id"].astype("Int64")
+    df["shared_source_reason"] = df["shared_source_reason"].fillna("")
+
+    assigned = df["assigned_source_id"].astype("Int64")
+    df["effective_source_id"] = assigned.where(
+        assigned.notna(), df["shared_source_id"]
+    ).astype("Int64")
+
+    counts = df["shared_source_reason"].value_counts()
+    print("\nShared sources resolved after the global assignment:")
+    for key in ("tie", "same_label", "tie+same_label"):
+        print(f"  {key:15s} {int(counts.get(key, 0))}")
+    print(f"  total           {int((df['shared_source_reason'] != '').sum())}")
+    return df
 
 
 # -----------------------------------------------------------------------------
@@ -2387,6 +2561,11 @@ def main(argv=None):
     # 1. Parse and prepare WDS components.
     wds_df = parse_wds_components(args.components)
     propagate_coordinates(wds_df)
+    flag_non_v_magnitudes(wds_df)
+    print(
+        f"WDS records with non-V-like magnitudes (notes "
+        f"{', '.join(NON_V_MAG_NOTE_CODES)}): {int(wds_df['wds_mag_nonV'].sum())}"
+    )
 
     _ensure_parent(args.output)
     _ensure_parent(args.candidates)
@@ -2421,6 +2600,10 @@ def main(argv=None):
         is_displaced=False,
         model_sample=False,
     )
+
+    raw_model_results = attach_non_v_flag(raw_model_results, wds_df)
+    disp_results = attach_non_v_flag(disp_results, wds_df)
+    raw_results = attach_non_v_flag(raw_results, wds_df)
 
     if len(raw_model_results) == 0:
         raise RuntimeError("No Gaia candidates were returned by the 15-arcsec RAW model query.")
@@ -2457,6 +2640,9 @@ def main(argv=None):
     # 10. Global one-to-one assignment.
     final_matches = optimize_global_assignments(scored_candidates, wds_df)
 
+    # 10b. Shared sources (component-level rules; no thresholds).
+    final_matches = resolve_shared_sources(final_matches)
+
     # 11. Save final output: one row per WDS component.
     final_matches.to_csv(args.output, index=False)
 
@@ -2477,6 +2663,8 @@ def main(argv=None):
         f"{n_eligible_scored}"
     )
     print(f"Globally assigned components: {n_assigned}")
+    n_shared = int((final_matches["shared_source_reason"] != "").sum())
+    print(f"Components inheriting a shared source: {n_shared}")
     print(f"Saved final catalog to: {args.output}")
     print(f"Saved scored candidates to: {args.candidates}")
 
